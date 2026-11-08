@@ -13,8 +13,9 @@
    limitations under the License. */
 
 // What the tests share: RPP itself (the reference every FastRPP function is compared with), pinned and device buffers,
-// seeded images, a double-precision reference of FastRPP's documented arithmetic, RPP's clamp region, and the agreement
-// machinery of fkl-benchmarks (082ce201, rpp/benchmark_rpp_preprocessing.h: Region, compareTensors, agreementRows).
+// seeded images, a double-precision reference of FastRPP's documented arithmetic, RPP's clamp region, the agreement
+// machinery of fkl-benchmarks (082ce201, rpp/benchmark_rpp_preprocessing.h: Region, compareTensors, agreementRows), an
+// FKL read of an F32 NCHW tensor, and fastrpp::Error's status.
 #pragma once
 
 #include <fast_rpp.h>
@@ -144,7 +145,6 @@ struct ImageSpec {
     size_t pitch;               // bytes between rows
     int roiX, roiY, roiW, roiH;
     float mean[3], stdDev[3];
-    uint32_t mirror;
     uint32_t perm[3]; // output channel k = normalised input channel perm[k]
 };
 
@@ -165,15 +165,14 @@ inline double sampleHalfPixel(const ImageSpec& s, const int dstW, const int dstH
            px(x2r, y2r) * ((sx - x1) * (sy - y1));
 }
 
-// Image i of rppt_resize_mirror_normalize (then the permutation), NCHW: out[(k * dstH + y) * dstW + x]
+// Image i of rppt_resize_mirror_normalize, no image mirrored (then the permutation), NCHW: out[(k * dstH + y) * dstW + x]
 inline void referenceImage(const ImageSpec& s, const int dstW, const int dstH, double* const out) {
     for (int y = 0; y < dstH; ++y) {
         for (int x = 0; x < dstW; ++x) {
-            const int xs = s.mirror == 1u ? dstW - 1 - x : x;
             double n[3];
             for (int c = 0; c < 3; ++c) {
                 const float invStdDev = 1.0f / s.stdDev[c];
-                n[c] = (sampleHalfPixel(s, dstW, dstH, xs, y, c) - static_cast<double>(s.mean[c])) * static_cast<double>(invStdDev);
+                n[c] = (sampleHalfPixel(s, dstW, dstH, x, y, c) - static_cast<double>(s.mean[c])) * static_cast<double>(invStdDev);
             }
             for (int k = 0; k < 3; ++k) {
                 out[(static_cast<size_t>(k) * dstH + static_cast<size_t>(y)) * dstW + static_cast<size_t>(x)] = n[s.perm[k]];
@@ -184,12 +183,11 @@ inline void referenceImage(const ImageSpec& s, const int dstW, const int dstH, d
 
 // RPP's clamp region: the destination pixels whose source position, computed as RPP 3.2.0 does (src = x * r + (r - 1) / 2
 // in float, r = roiSize / dstSize), has floor >= roiSize - 2 in x or in y. RPP never reads the last column and row of the
-// ROI there. For a mirrored image RPP computes destination column x at column dstW - 1 - x.
+// ROI there.
 inline bool rppEdge(const ImageSpec& s, const int dstW, const int dstH, const int x, const int y) {
     const float rx = static_cast<float>(s.roiW) / static_cast<float>(dstW);
     const float ry = static_cast<float>(s.roiH) / static_cast<float>(dstH);
-    const int xs = s.mirror == 1u ? dstW - 1 - x : x;
-    const float sx = static_cast<float>(xs) * rx + (rx - 1.0f) * 0.5f;
+    const float sx = static_cast<float>(x) * rx + (rx - 1.0f) * 0.5f;
     const float sy = static_cast<float>(y) * ry + (ry - 1.0f) * 0.5f;
     return std::floor(sx) >= static_cast<float>(s.roiW - 2) || std::floor(sy) >= static_cast<float>(s.roiH - 2);
 }
@@ -266,7 +264,38 @@ private:
     bool allPass_{true};
 };
 
-inline const char* implementationName(fastrpp::UniformBranches) { return "UniformBranches"; }
-inline const char* implementationName(fastrpp::Selects) { return "Selects"; }
+// FKL's read of a whole F32 NCHW tensor, for a test whose chain starts with rppt_channel_permute: FastRPP's functions
+// read only U8 sources, and an FKL IOp of the caller's can start a chain (fastrpp::executeOperations takes any FKL IOps)
+inline auto readNCHW(void* const ptr, const RpptDesc& d) {
+    fk::RawPtr<fk::ND::_3D, float> v;
+    v.data = reinterpret_cast<float*>(static_cast<unsigned char*>(ptr) + d.offsetInBytes);
+    v.dims = fk::PtrDims<fk::ND::_3D>(d.w, d.h, d.n, 3u, static_cast<uint>(d.w * sizeof(float)));
+    return fk::TensorPack<fk::float3>::build(v);
+}
+
+// Whether every float of a buffer still holds the sentinel bytes it was filled with
+inline bool holdsSentinel(const std::vector<float>& values, const uint32_t sentinel) {
+    for (const float v : values) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &v, sizeof(bits));
+        if (bits != sentinel) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Runs f and returns the status of the fastrpp::Error it throws, RPP_SUCCESS if it throws none; message gets its text
+template <typename F>
+RppStatus statusOf(F&& f, std::string& message) {
+    try {
+        f();
+    } catch (const fastrpp::Error& e) {
+        message = e.what();
+        return e.status();
+    }
+    message = "no exception";
+    return RPP_SUCCESS;
+}
 
 } // namespace fastrpp_test

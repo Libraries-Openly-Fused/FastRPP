@@ -12,11 +12,12 @@
    See the License for the specific language governing permissions and
    limitations under the License. */
 
-// fastrpp::rppt_resize_mirror_normalize against RPP's rppt_resize_mirror_normalize on the same inputs, for both
-// implementations of FastRPP's per-image mirror (UniformBranches, Selects).
+// fastrpp::rppt_resize_mirror_normalize against RPP's rppt_resize_mirror_normalize on the same inputs. FastRPP's read IOp
+// runs with fastrpp::rppt_copy's write IOp: executeOperations(handle, rmn, copy), one kernel.
 //
 // Source U8 NHWC, destination F32 NCHW, BILINEAR; per image a different ROI position, mean and standard deviation, and a
-// mirror flag of 0, 1 or 2 (RPP mirrors only on 1), mixed within the batch. Two source forms:
+// mirror flag of 0 or 2, mixed within the batch (RPP mirrors only on 1; FastRPP rejects 1: fastrpp_errors_test). Two
+// source forms:
 //   dense batch    both libraries read the same tensor of N images
 //   shared source  FastRPP reads N ROIs of one frame in place (nStride = 0, fastrpp::sharedSourceDesc); RPP reads the
 //                  same crops copied into a dense batch, RPP's documented batched form
@@ -55,11 +56,10 @@ RpptROI makeRoi(const int x, const int y, const int w, const int h, const RpptRo
     return roi;
 }
 
-template <size_t N, typename Impl>
+template <size_t N>
 void runCase(Report& report, const Case& c, const bool noise, const RpptRoiType roiType, const bool shared) {
     std::cout << c.name << ", N " << N << ", " << (noise ? "noise" : "gradient") << ", " << (roiType == RpptRoiType::XYWH ? "XYWH" : "LTRB")
-              << ", " << (shared ? "shared source (nStride 0) vs RPP on the crops copied into a dense batch" : "dense batch") << ", "
-              << implementationName(Impl{}) << std::endl;
+              << ", " << (shared ? "shared source (nStride 0) vs RPP on the crops copied into a dense batch" : "dense batch") << std::endl;
     const int frameW = shared ? 2 * c.srcW : c.srcW, frameH = shared ? 2 * c.srcH : c.srcH;
     const size_t imageBytes = static_cast<size_t>(frameW) * frameH * 3;
     std::vector<unsigned char> host;
@@ -97,8 +97,7 @@ void runCase(Report& report, const Case& c, const bool noise, const RpptRoiType 
             mean[3 * i + static_cast<size_t>(ch)] = s.mean[ch];
             stdDev[3 * i + static_cast<size_t>(ch)] = s.stdDev[ch];
         }
-        s.mirror = static_cast<uint32_t>((i + N) % 3); // 0, 1 and 2 mixed; RPP mirrors only on 1
-        mirror[i] = s.mirror;
+        mirror[i] = static_cast<Rpp32u>(((i + N) % 2) * 2); // 0 and 2 mixed: no mirror in either library
         sizes[i] = RpptImagePatch{static_cast<Rpp32u>(c.dstW), static_cast<Rpp32u>(c.dstH)};
         fastRois[i] = makeRoi(s.roiX, s.roiY, s.roiW, s.roiH, roiType);
     }
@@ -116,11 +115,11 @@ void runCase(Report& report, const Case& c, const bool noise, const RpptRoiType 
     fastrpp::rppHandle_t fastHandle{};
     FASTRPP_TEST_RPP(fastrpp::rppCreate(&fastHandle, N, 0, stream, RppBackend::RPP_HIP_BACKEND));
     const std::vector<RpptROI> roisBefore = fastRois;
-    const auto op = fastrpp::rppt_resize_mirror_normalize<N, RpptDataType::U8, RpptLayout::NHWC, RpptDataType::F32, RpptLayout::NCHW, 3, Impl>(
-        src.data(), &srcDesc, fastOut.data(), &dstDesc, sizes.data(), RpptInterpolationType::BILINEAR, mean.data(), stdDev.data(), mirror.data(),
-        fastRois.data(), roiType, fastHandle, RppBackend::RPP_HIP_BACKEND);
-    report.check("fastrpp::rppt_resize_mirror_normalize returns RPP_SUCCESS", op.status == RPP_SUCCESS);
-    FASTRPP_TEST_RPP(fastrpp::executeOperations(fastHandle, op));
+    const auto rmn = fastrpp::rppt_resize_mirror_normalize<N>(src.data(), &srcDesc, fastOut.data(), &dstDesc, sizes.data(),
+                                                              RpptInterpolationType::BILINEAR, mean.data(), stdDev.data(), mirror.data(),
+                                                              fastRois.data(), roiType, fastHandle, RppBackend::RPP_HIP_BACKEND);
+    const auto copy = fastrpp::rppt_copy(fastOut.data(), &dstDesc, fastOut.data(), &dstDesc, fastHandle, RppBackend::RPP_HIP_BACKEND);
+    fastrpp::executeOperations(fastHandle, rmn, copy);
     FASTRPP_TEST_HIP(hipStreamSynchronize(stream));
     const std::vector<float> fast = fastOut.download();
     report.check("the ROI array is unchanged", std::memcmp(roisBefore.data(), fastRois.data(), sizeof(RpptROI) * N) == 0);
@@ -176,11 +175,11 @@ void runCase(Report& report, const Case& c, const bool noise, const RpptRoiType 
 
 // FastRPP only, against the double reference: output 60x40 (60 is not a multiple of 8) from 30x20 ROIs (an exact 2x
 // upscale), images of 47x33 pixels with padded rows (hStride = 3 * 47 + 5 bytes), offsetInBytes 64 on the source and 128
-// on the destination, the parameter arrays in pageable memory, and guard bands before and after the destination tensor
-template <size_t N, typename Impl>
+// on the destination of rppt_copy, the parameter arrays in pageable memory, and guard bands before and after that
+// destination tensor
+template <size_t N>
 void runFastRppOnly(Report& report) {
-    std::cout << "FastRPP only: 30x20 ROIs of 47x33 images with padded rows -> 60x40, offsets, guard bands, N " << N << ", "
-              << implementationName(Impl{}) << std::endl;
+    std::cout << "FastRPP only: 30x20 ROIs of 47x33 images with padded rows -> 60x40, offsets, guard bands, N " << N << std::endl;
     constexpr int W = 47, H = 33, ROI_W = 30, ROI_H = 20, DST_W = 60, DST_H = 40;
     constexpr Rpp32u H_STRIDE = 3 * W + 5, SRC_OFFSET = 64, DST_OFFSET = 128;
     constexpr size_t GUARD = 4096;
@@ -213,8 +212,7 @@ void runFastRppOnly(Report& report) {
             mean[3 * i + c] = s.mean[c];
             stdDev[3 * i + c] = s.stdDev[c];
         }
-        s.mirror = static_cast<uint32_t>(i % 2);
-        mirror[i] = s.mirror;
+        mirror[i] = static_cast<Rpp32u>((i % 2) * 2);
         rois[i].xywhROI = {{s.roiX, s.roiY}, ROI_W, ROI_H};
     }
     RpptDesc srcDesc(N, 3, H, W, RpptDataType::U8, RpptLayout::NHWC, SRC_OFFSET, RpptStrides{static_cast<Rpp32u>(nStride), 1, H_STRIDE, 3});
@@ -227,11 +225,13 @@ void runFastRppOnly(Report& report) {
     FASTRPP_TEST_HIP(hipStreamCreate(&stream));
     fastrpp::rppHandle_t handle{};
     FASTRPP_TEST_RPP(fastrpp::rppCreate(&handle, N, 0, stream, RppBackend::RPP_HIP_BACKEND));
-    const auto op = fastrpp::rppt_resize_mirror_normalize<N, RpptDataType::U8, RpptLayout::NHWC, RpptDataType::F32, RpptLayout::NCHW, 3, Impl>(
-        src.data(), &srcDesc, dst.data(), &dstDesc, sizes.data(), RpptInterpolationType::BILINEAR, mean.data(), stdDev.data(), mirror.data(),
-        rois.data(), RpptRoiType::XYWH, handle, RppBackend::RPP_HIP_BACKEND);
-    report.check("fastrpp::rppt_resize_mirror_normalize returns RPP_SUCCESS", op.status == RPP_SUCCESS);
-    FASTRPP_TEST_RPP(fastrpp::executeOperations(handle, op));
+    // The explicit template arguments are the defaults
+    const auto rmn = fastrpp::rppt_resize_mirror_normalize<N, RpptDataType::U8, RpptLayout::NHWC, RpptDataType::F32, RpptLayout::NCHW, 3>(
+        src.data(), &srcDesc, nullptr, &dstDesc, sizes.data(), RpptInterpolationType::BILINEAR, mean.data(), stdDev.data(), mirror.data(),
+        rois.data(), RpptRoiType::XYWH, handle, RppBackend::RPP_HIP_BACKEND); // its dstPtr is never accessed: nullptr is fine
+    const auto copy = fastrpp::rppt_copy<RpptDataType::F32, RpptLayout::NCHW, RpptLayout::NCHW, 3>(nullptr, &dstDesc, dst.data(), &dstDesc,
+                                                                                                handle, RppBackend::RPP_HIP_BACKEND);
+    fastrpp::executeOperations(handle, rmn, copy);
     FASTRPP_TEST_HIP(hipStreamSynchronize(stream));
     FASTRPP_TEST_RPP(fastrpp::rppDestroy(handle, RppBackend::RPP_HIP_BACKEND));
     FASTRPP_TEST_HIP(hipStreamDestroy(stream));
@@ -263,25 +263,19 @@ const Case CASES[] = {
     {"100x60 -> 48x40 (100 / 48 is not exact in binary: informational)", 100, 60, 100, 60, 48, 40, false},
 };
 
-template <typename Impl>
-void runAll(Report& report) {
-    for (const Case& c : CASES) {
-        runCase<1, Impl>(report, c, true, RpptRoiType::XYWH, false);
-        runCase<7, Impl>(report, c, false, RpptRoiType::LTRB, false);
-        runCase<7, Impl>(report, c, true, RpptRoiType::XYWH, true);
-    }
-    runCase<300, Impl>(report, CASES[0], true, RpptRoiType::XYWH, true);
-    runCase<300, Impl>(report, CASES[0], true, RpptRoiType::LTRB, false);
-    runFastRppOnly<5, Impl>(report);
-}
-
 } // namespace
 
 int main() {
     try {
         Report report;
-        runAll<fastrpp::UniformBranches>(report);
-        runAll<fastrpp::Selects>(report);
+        for (const Case& c : CASES) {
+            runCase<1>(report, c, true, RpptRoiType::XYWH, false);
+            runCase<7>(report, c, false, RpptRoiType::LTRB, false);
+            runCase<7>(report, c, true, RpptRoiType::XYWH, true);
+        }
+        runCase<300>(report, CASES[0], true, RpptRoiType::XYWH, true);
+        runCase<300>(report, CASES[0], true, RpptRoiType::LTRB, false);
+        runFastRppOnly<5>(report);
         return report.exitCode();
     } catch (const std::exception& e) {
         std::cout << "EXCEPTION: " << e.what() << std::endl;

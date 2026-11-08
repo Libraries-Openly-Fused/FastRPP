@@ -1,5 +1,5 @@
-# FastRPP: AMD RPP's tensor API (rppt_*) as fusable operations of the Fused Kernel Library (FKL), HIP only.
-# Header only: the library target carries the include directories; the tests and tools are HIP executables.
+# FastRPP: AMD RPP's tensor API (rppt_*) as operations of the Fused Kernel Library (FKL), HIP only.
+# Header only: the library target carries the include directories; the tests are HIP executables.
 cmake_minimum_required(VERSION 3.28)
 
 # The RX 9060 (gfx1200) unless the configure says otherwise
@@ -8,14 +8,13 @@ if(NOT DEFINED CMAKE_HIP_PLATFORM)
     set(CMAKE_HIP_PLATFORM "amd")
 endif()
 
-project(FastRPP VERSION 0.1.0 DESCRIPTION "AMD RPP's tensor API as fusable FKL operations (HIP)" LANGUAGES CXX HIP)
+project(FastRPP VERSION 0.1.0 DESCRIPTION "AMD RPP's tensor API as FKL operations (HIP)" LANGUAGES CXX HIP)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
 option(FASTRPP_BUILD_TESTS "Build the tests (they need RPP's library and an AMD GPU to run)" ON)
-option(FASTRPP_BUILD_TOOLS "Build the measurement tools (not run by ctest)" ON)
 option(FASTRPP_CHECK_FKL_PIN "Fail the configure unless the fkl submodule is at the pinned commit" ON)
 
 # ---- FKL: the git submodule fkl, pinned to the LTS-C++17 branch (C++17). Nothing from FKL's main branch (C++20).
@@ -66,9 +65,6 @@ endfunction()
 if(FASTRPP_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
-endif()
-if(FASTRPP_BUILD_TOOLS)
-    add_subdirectory(tools)
 endif()
 
 message(STATUS "FastRPP ${PROJECT_VERSION}: HIP ${CMAKE_HIP_COMPILER_VERSION} (${CMAKE_HIP_COMPILER}), architectures "
