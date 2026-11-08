@@ -37,8 +37,8 @@
 
 namespace fastrpp_test {
 
-// The tolerance of every required comparison: 1e-4 absolute, as in fkl-benchmarks. The test parameters keep |output|
-// below 256, where one float step (about 3e-5) is below it.
+// The tolerance of the required comparisons: 1e-4 absolute, as in fkl-benchmarks. The test parameters keep |output|
+// below 256, where one float step is at most 2^-16 (about 1.5e-5).
 constexpr double TOLERANCE = 1e-4;
 
 inline void hipCheck(const hipError_t e, const char* expr, const char* file, const int line) {
@@ -79,6 +79,8 @@ public:
     explicit Device(const size_t count) : count_(count) {
         FASTRPP_TEST_HIP(hipMalloc(reinterpret_cast<void**>(&data_), sizeof(T) * std::max<size_t>(count, 1)));
     }
+    // Raw bytes of the allocation (for guard bands and byte offsets)
+    unsigned char* bytesPtr() const { return reinterpret_cast<unsigned char*>(data_); }
     ~Device() { static_cast<void>(hipFree(data_)); }
     Device(const Device&) = delete;
     Device& operator=(const Device&) = delete;
@@ -239,11 +241,16 @@ Region compare(const A* a, const B* b, const size_t n, const int w, const int h,
 // The rows of a test, printed as fkl-benchmarks' agreementRows prints them; a required row that fails fails the test
 class Report {
 public:
-    void row(const std::string& what, const Region& r, const bool required) {
-        const bool pass = r.maxAbs <= TOLERANCE;
+    // A row passes when its maximum is within tolerance (TOLERANCE unless a row says otherwise)
+    void row(const std::string& what, const Region& r, const bool required, const double tolerance = TOLERANCE) {
+        const bool pass = r.maxAbs <= tolerance;
         allPass_ &= pass || !required;
         std::cout << "  " << what << ": max " << r.maxAbs << ", mean " << r.meanAbs << ", over 1e-4 " << r.fractionOver << " (" << r.count
-                  << " values)" << (required ? (pass ? " ok" : " FAIL") : " (informational)") << std::endl;
+                  << " values)" << (required ? (pass ? " ok" : " FAIL") : " (informational)");
+        if (tolerance != TOLERANCE) {
+            std::cout << " [tolerance " << tolerance << "]";
+        }
+        std::cout << std::endl;
     }
     void check(const std::string& what, const bool pass) {
         allPass_ &= pass;

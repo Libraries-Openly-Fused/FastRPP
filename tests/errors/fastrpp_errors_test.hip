@@ -12,8 +12,9 @@
    See the License for the specific language governing permissions and
    limitations under the License. */
 
-// The handle and every documented status: fastrpp::rppCreate / rppDestroy, the checks of each operation, and
-// executeOperations, which returns the first failure and launches nothing (the destination keeps its sentinel).
+// The handle and the documented statuses: fastrpp::rppCreate / rppDestroy, the checks of each operation, and
+// executeOperations, which returns the first failure and launches nothing. Both buffers a launch could write (the
+// intermediate `mid` and the destination `out`) hold a sentinel, so a launch would show.
 #include <common/test_common.h>
 
 using namespace fastrpp_test;
@@ -47,6 +48,7 @@ struct Fixture {
             rois[i].xywhROI = {{0, 0}, W, H};
         }
         FASTRPP_TEST_RPP(fastrpp::rppCreate(&handle, N, 0, nullptr, RppBackend::RPP_HIP_BACKEND));
+        mid.fillBytes(0x5A);
         out.fillBytes(0x5A);
     }
     ~Fixture() { static_cast<void>(fastrpp::rppDestroy(handle, RppBackend::RPP_HIP_BACKEND)); }
@@ -56,19 +58,20 @@ struct Fixture {
         return fastrpp::rppt_resize_mirror_normalize<N>(src.data(), s, mid.data(), d, sizes.data(), interpolation, mean.data(), stdDev.data(),
                                                         mirror.data(), rois.data(), roiType, handle, backend);
     }
-    auto permute(RpptDesc* s, RpptDesc* d, void* srcPtr = nullptr) {
-        return fastrpp::rppt_channel_permute<N>(srcPtr ? srcPtr : mid.data(), s, out.data(), d, permutation.data(), handle,
-                                                RppBackend::RPP_HIP_BACKEND);
+    auto permute(RpptDesc* s, RpptDesc* d, void* srcPtr = nullptr, fastrpp::rppHandle_t h = nullptr,
+                 const RppBackend backend = RppBackend::RPP_HIP_BACKEND) {
+        return fastrpp::rppt_channel_permute<N>(srcPtr ? srcPtr : mid.data(), s, out.data(), d, permutation.data(), h ? h : handle, backend);
     }
-    // The destination still holds its sentinel: nothing was launched
-    bool outUntouched() const {
+    // Both buffers a launch could write still hold their sentinel
+    bool untouched() const {
         FASTRPP_TEST_HIP(hipDeviceSynchronize());
-        const std::vector<float> host = out.download();
-        for (const float v : host) {
-            uint32_t bits = 0;
-            std::memcpy(&bits, &v, sizeof(bits));
-            if (bits != 0x5A5A5A5Au) {
-                return false;
+        for (const Device<float>* buffer : {&mid, &out}) {
+            for (const float v : buffer->download()) {
+                uint32_t bits = 0;
+                std::memcpy(&bits, &v, sizeof(bits));
+                if (bits != 0x5A5A5A5Au) {
+                    return false;
+                }
             }
         }
         return true;
@@ -92,8 +95,11 @@ int main() {
         expect(report, "rppCreate with the host back-end", fastrpp::rppCreate(&h, 1, 0, nullptr, RppBackend::RPP_HOST_BACKEND),
                rppStatusNotImplemented);
         expect(report, "rppCreate with the HIP back-end", fastrpp::rppCreate(&h, 1, 0, nullptr, RppBackend::RPP_HIP_BACKEND), rppStatusSuccess);
-        expect(report, "rppDestroy with the host back-end", fastrpp::rppDestroy(h, RppBackend::RPP_HOST_BACKEND), rppStatusNotImplemented);
-        expect(report, "rppDestroy", fastrpp::rppDestroy(h, RppBackend::RPP_HIP_BACKEND), rppStatusSuccess);
+        expect(report, "rppDestroy with the default (host) back-end value frees the handle, as RPP's GPU build does", fastrpp::rppDestroy(h),
+               rppStatusSuccess);
+        expect(report, "rppCreate with the HIP back-end, again", fastrpp::rppCreate(&h, 1, 0, nullptr, RppBackend::RPP_HIP_BACKEND),
+               rppStatusSuccess);
+        expect(report, "rppDestroy with the HIP back-end", fastrpp::rppDestroy(h, RppBackend::RPP_HIP_BACKEND), rppStatusSuccess);
         expect(report, "rppDestroy of a null handle", fastrpp::rppDestroy(nullptr, RppBackend::RPP_HIP_BACKEND), rppStatusBadParm);
 
         std::cout << "rppt_resize_mirror_normalize" << std::endl;
@@ -102,6 +108,7 @@ int main() {
         expect(report, "host back-end", f.rmn(&f.srcDesc, &f.outDesc, RpptInterpolationType::BILINEAR, RpptRoiType::XYWH, RppBackend::RPP_HOST_BACKEND).status,
                RPP_ERROR_NOT_IMPLEMENTED);
         expect(report, "NEAREST_NEIGHBOR", f.rmn(&f.srcDesc, &f.outDesc, RpptInterpolationType::NEAREST_NEIGHBOR).status, RPP_ERROR_NOT_IMPLEMENTED);
+        expect(report, "a null destination descriptor", f.rmn(&f.srcDesc, nullptr).status, RPP_ERROR_INVALID_ARGUMENTS);
         {
             RpptDesc s = f.srcDesc;
             s.numDims = 3;
@@ -124,9 +131,18 @@ int main() {
             expect(report, "source n != BATCH", f.rmn(&s, &f.outDesc).status, RPP_ERROR_INVALID_ARGUMENTS);
         }
         {
+            RpptDesc s(N, 3, H, 0, RpptDataType::U8, RpptLayout::NHWC);
+            expect(report, "source of width 0", f.rmn(&s, &f.outDesc).status, RPP_ERROR_INVALID_DIM_LENGTHS);
+        }
+        {
             RpptDesc s = f.srcDesc;
             s.strides.wStride = 4;
             expect(report, "source pixels not packed (wStride 4)", f.rmn(&s, &f.outDesc).status, RPP_ERROR_INVALID_SRC_LAYOUT);
+        }
+        {
+            RpptDesc s = f.srcDesc;
+            s.strides.hStride = 3 * W - 1;
+            expect(report, "source rows shorter than 3 * w", f.rmn(&s, &f.outDesc).status, RPP_ERROR_INVALID_SRC_LAYOUT);
         }
         {
             RpptDesc d(N, 3, OUT_H, OUT_W, RpptDataType::F16, RpptLayout::NCHW);
@@ -169,19 +185,21 @@ int main() {
         for (size_t i = 0; i < N; ++i) {
             f.rois[i].xywhROI = {{0, 0}, W, H};
         }
+        fastrpp::rppHandle_t other{};
+        FASTRPP_TEST_RPP(fastrpp::rppCreate(&other, N + 1, 0, nullptr, RppBackend::RPP_HIP_BACKEND));
         {
-            fastrpp::rppHandle_t other{};
-            FASTRPP_TEST_RPP(fastrpp::rppCreate(&other, N + 1, 0, nullptr, RppBackend::RPP_HIP_BACKEND));
             const auto op = fastrpp::rppt_resize_mirror_normalize<N>(f.src.data(), &f.srcDesc, f.mid.data(), &f.outDesc, f.sizes.data(),
                                                                      RpptInterpolationType::BILINEAR, f.mean.data(), f.stdDev.data(),
                                                                      f.mirror.data(), f.rois.data(), RpptRoiType::XYWH, other,
                                                                      RppBackend::RPP_HIP_BACKEND);
             expect(report, "handle batch size != BATCH", op.status, RPP_ERROR_INVALID_ARGUMENTS);
-            FASTRPP_TEST_RPP(fastrpp::rppDestroy(other, RppBackend::RPP_HIP_BACKEND));
         }
 
         std::cout << "rppt_channel_permute" << std::endl;
         expect(report, "valid arguments", f.permute(&f.outDesc, &f.outDesc).status, RPP_SUCCESS);
+        expect(report, "host back-end", f.permute(&f.outDesc, &f.outDesc, nullptr, nullptr, RppBackend::RPP_HOST_BACKEND).status,
+               RPP_ERROR_NOT_IMPLEMENTED);
+        expect(report, "handle batch size != BATCH", f.permute(&f.outDesc, &f.outDesc, nullptr, other).status, RPP_ERROR_INVALID_ARGUMENTS);
         {
             RpptDesc d(N, 3, OUT_H, OUT_W + 8, RpptDataType::F32, RpptLayout::NCHW);
             expect(report, "source and destination of different sizes", f.permute(&f.outDesc, &d).status, RPP_ERROR_INVALID_DIM_LENGTHS);
@@ -189,6 +207,15 @@ int main() {
         {
             RpptDesc s(N, 3, OUT_H, OUT_W, RpptDataType::U8, RpptLayout::NCHW);
             expect(report, "source U8", f.permute(&s, &f.outDesc).status, RPP_ERROR_INVALID_SRC_DATATYPE);
+        }
+        {
+            RpptDesc d = f.outDesc;
+            d.strides.nStride += 16;
+            expect(report, "destination with padding between images", f.permute(&f.outDesc, &d).status, RPP_ERROR_INVALID_DST_LAYOUT);
+        }
+        {
+            RpptDesc big(N, 3, 16384, 16384, RpptDataType::F32, RpptLayout::NCHW); // 12 GiB: past FKL's 32-bit tensor offsets
+            expect(report, "tensors larger than 4 GiB", f.permute(&big, &big).status, RPP_ERROR_NOT_IMPLEMENTED);
         }
         f.permutation[3] = 0;
         f.permutation[4] = 0;
@@ -200,21 +227,42 @@ int main() {
         expect(report, "triple (3, 1, 0)", f.permute(&f.outDesc, &f.outDesc).status, RPP_ERROR_INVALID_ARGUMENTS);
 
         std::cout << "executeOperations: the first failure, nothing launched" << std::endl;
+        const auto good = f.rmn(&f.srcDesc, &f.outDesc);
         const auto badPermute = f.permute(&f.outDesc, &f.outDesc);
         expect(report, "an operation that failed its checks", fastrpp::executeOperations(f.handle, badPermute), RPP_ERROR_INVALID_ARGUMENTS);
-        report.check("nothing was launched", f.outUntouched());
+        expect(report, "a chain whose second operation failed its checks", fastrpp::executeOperations(f.handle, good, badPermute),
+               RPP_ERROR_INVALID_ARGUMENTS);
+        report.check("nothing was launched", f.untouched());
         f.permutation[3] = 2;
         f.permutation[4] = 1;
         f.permutation[5] = 0;
-        const auto good = f.rmn(&f.srcDesc, &f.outDesc);
-        const auto wrongSource = f.permute(&f.outDesc, &f.outDesc, f.out.data()); // reads out, not rmn's destination mid
-        expect(report, "a broken chain (the permutation does not read the resize's destination)",
-               fastrpp::executeOperations(f.handle, good, wrongSource), RPP_ERROR_INVALID_ARGUMENTS);
-        report.check("nothing was launched", f.outUntouched());
-        expect(report, "a null handle", fastrpp::executeOperations(nullptr, good), RPP_ERROR_INVALID_ARGUMENTS);
+        const auto wrongSource = f.permute(&f.outDesc, &f.outDesc, f.out.data()); // reads out, not the resize's destination mid
+        expect(report, "a broken chain: the permutation reads another buffer", fastrpp::executeOperations(f.handle, good, wrongSource),
+               RPP_ERROR_INVALID_ARGUMENTS);
+        RpptDesc shifted = f.outDesc;
+        shifted.offsetInBytes = 16;
+        const auto wrongDesc = f.permute(&shifted, &f.outDesc); // the same pointer, another descriptor
+        expect(report, "a broken chain: the permutation reads another descriptor", fastrpp::executeOperations(f.handle, good, wrongDesc),
+               RPP_ERROR_INVALID_ARGUMENTS);
         const auto chained = f.permute(&f.outDesc, &f.outDesc);
+        expect(report, "a handle whose batch size is not BATCH", fastrpp::executeOperations(other, good, chained), RPP_ERROR_INVALID_ARGUMENTS);
+        expect(report, "a null handle", fastrpp::executeOperations(nullptr, good), RPP_ERROR_INVALID_ARGUMENTS);
+        report.check("nothing was launched", f.untouched());
+        FASTRPP_TEST_RPP(fastrpp::rppDestroy(other, RppBackend::RPP_HIP_BACKEND));
         expect(report, "a valid chain", fastrpp::executeOperations(f.handle, good, chained), RPP_SUCCESS);
-        report.check("the valid chain wrote its destination", !f.outUntouched());
+        FASTRPP_TEST_HIP(hipDeviceSynchronize());
+        bool midStill = true, outWritten = false;
+        for (const float v : f.mid.download()) {
+            uint32_t bits = 0;
+            std::memcpy(&bits, &v, sizeof(bits));
+            midStill &= bits == 0x5A5A5A5Au;
+        }
+        for (const float v : f.out.download()) {
+            uint32_t bits = 0;
+            std::memcpy(&bits, &v, sizeof(bits));
+            outWritten |= bits != 0x5A5A5A5Au;
+        }
+        report.check("the valid chain wrote its destination and not the intermediate buffer", midStill && outWritten);
         return report.exitCode();
     } catch (const std::exception& e) {
         std::cout << "EXCEPTION: " << e.what() << std::endl;

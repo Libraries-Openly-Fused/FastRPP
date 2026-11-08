@@ -80,7 +80,18 @@ static_assert(std::is_same_v<decltype(fastrpp::detail::permutationCase(0u, 1u, 2
 
 } // namespace
 
+// A chain of three operations, and implementations mixed within a chain
+using RmnBranches = fastrpp::ResizeMirrorNormalize<10, fastrpp::UniformBranches>;
+using CpSelects = fastrpp::ChannelPermute<10, fastrpp::Selects>;
+using CpBranches = fastrpp::ChannelPermute<10, fastrpp::UniformBranches>;
+static_assert(std::is_same_v<decltype(fastrpp::executeOperations(std::declval<fastrpp::rppHandle_t>(), std::declval<const RmnBranches&>(),
+                                                                 std::declval<const CpSelects&>(), std::declval<const CpBranches&>())),
+                             RppStatus>,
+              "a mixed chain of three operations");
+
 int main() {
+    const auto mixedChain = &fastrpp::executeOperations<RmnBranches, CpSelects, CpBranches>; // instantiates it
+    static_cast<void>(mixedChain);
     instantiate<1, fastrpp::UniformBranches>();
     instantiate<1, fastrpp::Selects>();
     instantiate<300, fastrpp::UniformBranches>();

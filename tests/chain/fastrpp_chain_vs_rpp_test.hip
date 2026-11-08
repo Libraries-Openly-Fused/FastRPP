@@ -152,6 +152,115 @@ void runAll(Report& report, const std::vector<unsigned char>& frameHost, const D
     }
 }
 
+// Three operations, two implementations: rppt_resize_mirror_normalize (ImplA) -> rppt_channel_permute (ImplB, permutation
+// P1) -> rppt_channel_permute (ImplB, P2), one kernel, against RPP's three calls; per-image parameters mixed as above.
+// Output channel k is the normalised channel P1[P2[k]]; neither intermediate buffer may be written.
+template <size_t N, typename ImplA, typename ImplB>
+void runThreeOperations(Report& report, const std::vector<unsigned char>& frameHost, const Device<unsigned char>& frame) {
+    std::cout << "chain rppt_resize_mirror_normalize -> rppt_channel_permute -> rppt_channel_permute, pipeline (a), N " << N
+              << ", mixed per-image parameters, " << implementationName(ImplA{}) << " then " << implementationName(ImplB{}) << std::endl;
+    const uint32_t perms[6][3] = {{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}};
+    std::vector<ImageSpec> specs(N);
+    Pinned<Rpp32f> mean(3 * N), stdDev(3 * N);
+    Pinned<Rpp32u> mirror(N), p1(3 * N), p2(3 * N);
+    Pinned<RpptImagePatch> sizes(N);
+    std::vector<RpptROI> rois(N);
+    for (size_t i = 0; i < N; ++i) {
+        ImageSpec& s = specs[i];
+        s.image = frameHost.data();
+        s.pitch = static_cast<size_t>(SRC_W) * 3;
+        s.roiX = static_cast<int>(i);
+        s.roiY = static_cast<int>(i);
+        s.roiW = CROP_W;
+        s.roiH = CROP_H;
+        const uint32_t* const a = perms[(i * 5) % 6];
+        const uint32_t* const b = perms[(i + 2) % 6];
+        for (size_t c = 0; c < 3; ++c) {
+            s.mean[c] = static_cast<float>((i * 7 + c * 11) % 40);
+            s.stdDev[c] = 1.0f + 0.25f * static_cast<float>((i * 3 + c) % 7);
+            mean[3 * i + c] = s.mean[c];
+            stdDev[3 * i + c] = s.stdDev[c];
+            p1[3 * i + c] = a[c];
+            p2[3 * i + c] = b[c];
+        }
+        for (size_t k = 0; k < 3; ++k) {
+            s.perm[k] = a[b[k]];
+        }
+        s.mirror = static_cast<uint32_t>((i + 1) % 3);
+        mirror[i] = s.mirror;
+        sizes[i] = RpptImagePatch{OUT_W, OUT_H};
+        rois[i].xywhROI = {{s.roiX, s.roiY}, CROP_W, CROP_H};
+    }
+    const size_t outCount = N * 3 * static_cast<size_t>(OUT_W) * OUT_H;
+    RpptDesc outDesc(N, 3, OUT_H, OUT_W, RpptDataType::F32, RpptLayout::NCHW);
+    hipStream_t stream{};
+    FASTRPP_TEST_HIP(hipStreamCreate(&stream));
+
+    RpptDesc frameDesc = fastrpp::sharedSourceDesc(N, 3, SRC_H, SRC_W, RpptDataType::U8, RpptLayout::NHWC, SRC_W * 3);
+    Device<float> mid1(outCount), mid2(outCount), fastOut(outCount);
+    mid1.fillBytes(0xFF);
+    mid2.fillBytes(0xFF);
+    fastOut.fillBytes(0xFF);
+    fastrpp::rppHandle_t fastHandle{};
+    FASTRPP_TEST_RPP(fastrpp::rppCreate(&fastHandle, N, 0, stream, RppBackend::RPP_HIP_BACKEND));
+    const auto rmn = fastrpp::rppt_resize_mirror_normalize<N, RpptDataType::U8, RpptLayout::NHWC, RpptDataType::F32, RpptLayout::NCHW, 3, ImplA>(
+        frame.data(), &frameDesc, mid1.data(), &outDesc, sizes.data(), RpptInterpolationType::BILINEAR, mean.data(), stdDev.data(), mirror.data(),
+        rois.data(), RpptRoiType::XYWH, fastHandle, RppBackend::RPP_HIP_BACKEND);
+    const auto cp1 = fastrpp::rppt_channel_permute<N, RpptDataType::F32, RpptLayout::NCHW, RpptLayout::NCHW, 3, ImplB>(
+        mid1.data(), &outDesc, mid2.data(), &outDesc, p1.data(), fastHandle, RppBackend::RPP_HIP_BACKEND);
+    const auto cp2 = fastrpp::rppt_channel_permute<N, RpptDataType::F32, RpptLayout::NCHW, RpptLayout::NCHW, 3, ImplB>(
+        mid2.data(), &outDesc, fastOut.data(), &outDesc, p2.data(), fastHandle, RppBackend::RPP_HIP_BACKEND);
+    report.check("the three operations return RPP_SUCCESS",
+                 rmn.status == RPP_SUCCESS && cp1.status == RPP_SUCCESS && cp2.status == RPP_SUCCESS);
+    FASTRPP_TEST_RPP(fastrpp::executeOperations(fastHandle, rmn, cp1, cp2));
+    FASTRPP_TEST_HIP(hipStreamSynchronize(stream));
+    const std::vector<float> fast = fastOut.download();
+    bool untouched = true;
+    for (const Device<float>* buffer : {&mid1, &mid2}) {
+        for (const float v : buffer->download()) {
+            uint32_t bits = 0;
+            std::memcpy(&bits, &v, sizeof(bits));
+            untouched &= bits == 0xFFFFFFFFu;
+        }
+    }
+    report.check("neither intermediate buffer is written", untouched);
+    FASTRPP_TEST_RPP(fastrpp::rppDestroy(fastHandle, RppBackend::RPP_HIP_BACKEND));
+
+    const size_t cropBytes = static_cast<size_t>(CROP_W) * CROP_H * 3;
+    Device<unsigned char> crops(cropBytes * N);
+    for (size_t i = 0; i < N; ++i) {
+        FASTRPP_TEST_HIP(hipMemcpy2D(crops.data() + cropBytes * i, static_cast<size_t>(CROP_W) * 3, frame.data() + (i * SRC_W + i) * 3,
+                                     static_cast<size_t>(SRC_W) * 3, static_cast<size_t>(CROP_W) * 3, CROP_H, hipMemcpyDeviceToDevice));
+    }
+    RpptDesc cropDesc(N, 3, CROP_H, CROP_W, RpptDataType::U8, RpptLayout::NHWC);
+    Pinned<RpptROI> rppRois(rppRoiCapacity(N));
+    for (size_t i = 0; i < N; ++i) {
+        rppRois[i].xywhROI = {{0, 0}, CROP_W, CROP_H};
+    }
+    Device<float> r1(outCount), r2(outCount), rppOut(outCount);
+    rppHandle_t rppHandle{};
+    FASTRPP_TEST_RPP(rppCreate(&rppHandle, N, 0, stream, RppBackend::RPP_HIP_BACKEND));
+    FASTRPP_TEST_RPP(rppt_resize_mirror_normalize(crops.data(), &cropDesc, r1.data(), &outDesc, sizes.data(), RpptInterpolationType::BILINEAR,
+                                                  mean.data(), stdDev.data(), mirror.data(), rppRois.data(), RpptRoiType::XYWH, rppHandle,
+                                                  RppBackend::RPP_HIP_BACKEND));
+    FASTRPP_TEST_RPP(rppt_channel_permute(r1.data(), &outDesc, r2.data(), &outDesc, p1.data(), rppHandle, RppBackend::RPP_HIP_BACKEND));
+    FASTRPP_TEST_RPP(rppt_channel_permute(r2.data(), &outDesc, rppOut.data(), &outDesc, p2.data(), rppHandle, RppBackend::RPP_HIP_BACKEND));
+    FASTRPP_TEST_HIP(hipStreamSynchronize(stream));
+    const std::vector<float> rpp = rppOut.download();
+    FASTRPP_TEST_RPP(rppDestroy(rppHandle, RppBackend::RPP_HIP_BACKEND));
+    FASTRPP_TEST_HIP(hipStreamDestroy(stream));
+
+    const size_t imageValues = 3 * static_cast<size_t>(OUT_W) * OUT_H;
+    std::vector<double> expected(outCount);
+    for (size_t i = 0; i < N; ++i) {
+        referenceImage(specs[i], OUT_W, OUT_H, expected.data() + i * imageValues);
+    }
+    auto outsideClampRegion = [&](const size_t i, const int x, const int y) { return !rppEdge(specs[i], OUT_W, OUT_H, x, y); };
+    auto everywhere = [](const size_t, const int, const int) { return true; };
+    report.row("FastRPP vs RPP, outside RPP's clamp region", compare(fast.data(), rpp.data(), N, OUT_W, OUT_H, outsideClampRegion), true);
+    report.row("FastRPP vs the double half-pixel reference, every pixel", compare(fast.data(), expected.data(), N, OUT_W, OUT_H, everywhere), true);
+}
+
 } // namespace
 
 int main() {
@@ -163,6 +272,8 @@ int main() {
         Report report;
         runAll<fastrpp::UniformBranches>(report, frameHost, frame);
         runAll<fastrpp::Selects>(report, frameHost, frame);
+        runThreeOperations<10, fastrpp::UniformBranches, fastrpp::Selects>(report, frameHost, frame);
+        runThreeOperations<10, fastrpp::Selects, fastrpp::UniformBranches>(report, frameHost, frame);
         return report.exitCode();
     } catch (const std::exception& e) {
         std::cout << "EXCEPTION: " << e.what() << std::endl;

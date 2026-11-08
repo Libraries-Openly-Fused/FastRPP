@@ -76,13 +76,14 @@ inline rppStatus_t rppCreate(rppHandle_t* handle, size_t nBatchSize, Rpp32u numT
     return rppStatusSuccess;
 }
 
-// RPP's rppDestroy. The stream given to rppCreate is the caller's and stays alive.
+// RPP's rppDestroy. As in RPP 3.2.0's GPU build, either back-end value destroys the handle (RPP_HOST_BACKEND is the
+// default argument). The stream given to rppCreate is the caller's and stays alive, as in RPP.
 inline rppStatus_t rppDestroy(rppHandle_t handle, RppBackend backend = RppBackend::RPP_HOST_BACKEND) {
+    if (backend != RppBackend::RPP_HOST_BACKEND && backend != RppBackend::RPP_HIP_BACKEND) {
+        return rppStatusNotImplemented;
+    }
     if (handle == nullptr) {
         return rppStatusBadParm;
-    }
-    if (backend != RppBackend::RPP_HIP_BACKEND) {
-        return rppStatusNotImplemented;
     }
     delete handle;
     return rppStatusSuccess;
@@ -120,11 +121,11 @@ struct Selects {};
 using DefaultImplementation = UniformBranches;
 
 namespace detail {
-// FKL's operation macros (DECLARE_*_PARENT) name these fk:: entities without qualification
+// FKL's operation macros (DECLARE_*_PARENT) name Point, BatchUtils, BatchRead and PlanePolicy without qualification;
+// MirrorX::getActiveThreads returns an ActiveThreads
 using fk::ActiveThreads;
 using fk::BatchRead;
 using fk::BatchUtils;
-using fk::OperationData;
 using fk::PlanePolicy;
 using fk::Point;
 
@@ -253,6 +254,12 @@ using TensorView = fk::RawPtr<fk::ND::_3D, float>;
 // channel k of a pixel k * w * h elements after channel 0, and image z at z * 3 planes
 inline bool isDenseNCHW(const RpptDesc& d) {
     return d.strides.wStride == 1u && d.strides.hStride == d.w && d.strides.cStride == d.h * d.w && d.strides.nStride == d.c * d.h * d.w;
+}
+
+// FKL addresses image z of a 3D tensor with a 32-bit byte offset (PtrAccessor<ND::_3D>: plane_pitch * color_planes * z),
+// so a float tensor must fit in 4 GiB, offsetInBytes included
+inline bool fitsFklTensor(const RpptDesc& d) {
+    return static_cast<uint64_t>(d.offsetInBytes) + static_cast<uint64_t>(d.n) * d.strides.nStride * sizeof(float) <= UINT32_MAX;
 }
 
 inline TensorView tensorView(void* const ptr, const RpptDesc& d) {
@@ -439,6 +446,9 @@ inline ResizeMirrorNormalize<BATCH, Impl> rppt_resize_mirror_normalize(RppPtr_t 
     if (!detail::isDenseNCHW(dst)) {
         return fail(RPP_ERROR_INVALID_DST_LAYOUT);
     }
+    if (!detail::fitsFklTensor(dst)) {
+        return fail(RPP_ERROR_NOT_IMPLEMENTED); // larger than 4 GiB: FKL's 32-bit tensor offsets
+    }
 
     const fk::Size dstSize(static_cast<int>(dst.w), static_cast<int>(dst.h));
     Rpp8u* const base = static_cast<Rpp8u*>(srcPtr) + src.offsetInBytes;
@@ -477,8 +487,9 @@ inline ResizeMirrorNormalize<BATCH, Impl> rppt_resize_mirror_normalize(RppPtr_t 
 
 // RPP's rppt_channel_permute (rppt_tensor_data_exchange_operations.h), as an operation: output channel k of image i is
 // input channel permutationTensor[3 * i + k], as in RPP. Implemented: F32 NCHW to F32 NCHW, 3 channels, dense strides,
-// the same w x h. BATCH = srcDesc n = dstDesc n = the handle's batch size. Every triple must be a permutation of 0, 1, 2
-// (RPP does not check; other values are undefined there). The permutations are read on the host, now.
+// the same w x h, at most 4 GiB. BATCH = srcDesc n = dstDesc n = the handle's batch size. Every triple must be one of the
+// six permutations of 0, 1, 2, the function RPP documents; RPP checks nothing (a repeated index copies a channel there,
+// an index above 2 is undefined). The permutations are read on the host, now.
 template <size_t BATCH, RpptDataType TYPE = RpptDataType::F32, RpptLayout SRC_LAYOUT = RpptLayout::NCHW,
           RpptLayout DST_LAYOUT = RpptLayout::NCHW, Rpp32u CHANNELS = 3, typename Impl = DefaultImplementation>
 inline ChannelPermute<BATCH, Impl> rppt_channel_permute(RppPtr_t srcPtr, RpptDescPtr srcDescPtr, RppPtr_t dstPtr, RpptDescPtr dstDescPtr,
@@ -519,6 +530,9 @@ inline ChannelPermute<BATCH, Impl> rppt_channel_permute(RppPtr_t srcPtr, RpptDes
     }
     if (!detail::isDenseNCHW(dst)) {
         return fail(RPP_ERROR_INVALID_DST_LAYOUT);
+    }
+    if (!detail::fitsFklTensor(src) || !detail::fitsFklTensor(dst)) {
+        return fail(RPP_ERROR_NOT_IMPLEMENTED); // larger than 4 GiB: FKL's 32-bit tensor offsets
     }
     for (size_t i = 0; i < BATCH; ++i) {
         const Rpp32u* const p = permutationTensor + 3 * i;
@@ -600,10 +614,12 @@ inline auto fuse(const First& first, const Rest&... rest) {
 }
 } // namespace detail
 
-// Runs a chain of FastRPP operations as one kernel on the handle's stream: the first operation's source, every
-// operation's computation, the last operation's destination; the intermediate destinations are not written. It does not
-// synchronise the stream. It returns the first failed check of an operation, RPP_ERROR_INVALID_ARGUMENTS if the
-// operations do not form a chain, or RPP_ERROR_HIP_LAUNCH if the launch fails; nothing is launched after an error.
+// Runs a chain of FastRPP operations as one kernel on the stream of the handle given here: the first operation's source,
+// every operation's computation, the last operation's destination; the intermediate destinations are not written. It
+// does not synchronise the stream. It returns the first failed check of an operation, RPP_ERROR_INVALID_ARGUMENTS if the
+// operations do not form a chain or the handle's batch size is not BATCH (nothing is launched then), or
+// RPP_ERROR_HIP_LAUNCH if a HIP error is pending after the launch (FKL checks hipGetLastError, so the error may come from
+// earlier work on the device; the kernel may have been enqueued).
 template <typename First, typename... Rest>
 inline RppStatus executeOperations(rppHandle_t rppHandle, const First& first, const Rest&... rest) {
     static_assert(First::STARTS_CHAIN, "this operation cannot start a chain");
