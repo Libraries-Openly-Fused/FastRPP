@@ -1,14 +1,14 @@
 name: ROCm (gfx1200)
 
 # Runs on the self-hosted ROCm runner, which is also a benchmark machine: only on pull requests to main and by hand,
-# never on a push, and one run per branch at a time.
+# never on a push, and one run per branch at a time (a pull request's runs and manual runs of its branch share a group).
 on:
   pull_request:
     branches: ["main"]
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:

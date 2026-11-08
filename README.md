@@ -19,14 +19,15 @@ The scope is what the RPP pre-processing benchmark of
 
 | RPP 3.2.0 | FastRPP | Implemented | Differences from RPP (see below) | Tests |
 |---|---|---|---|---|
-| `rppCreate` | `fastrpp::rppCreate` | `RPP_HIP_BACKEND` | FastRPP's own handle type; no scratch memory | `fastrpp_errors_test` |
-| `rppDestroy` | `fastrpp::rppDestroy` | `RPP_HIP_BACKEND` | the stream given to `rppCreate` stays alive | `fastrpp_errors_test` |
-| `rppt_resize_mirror_normalize` | `fastrpp::rppt_resize_mirror_normalize<BATCH>` | `BILINEAR`; U8 NHWC, 3 channels -> F32 NCHW, 3 channels, dense destination; one output size for the batch | the last columns and rows; no clearing, no synchronisation; the ROI array is not modified; host-readable parameter arrays; accepts `nStride = 0` (shared-source batch) | `fastrpp_resize_mirror_normalize_vs_rpp_test`, `fastrpp_chain_vs_rpp_test` |
-| `rppt_channel_permute` | `fastrpp::rppt_channel_permute<BATCH>` | F32 NCHW, 3 channels -> F32 NCHW, 3 channels, dense | the triples are checked; host-readable | `fastrpp_channel_permute_vs_rpp_test`, `fastrpp_chain_vs_rpp_test` |
+| `rppCreate` | `fastrpp::rppCreate` | `RPP_HIP_BACKEND` | FastRPP's own handle type; no device or scratch memory; batch size 0 and a null handle pointer give `rppStatusBadParm`, `RPP_HOST_BACKEND` gives `rppStatusNotImplemented` | `fastrpp_errors_test` |
+| `rppDestroy` | `fastrpp::rppDestroy` | either back-end value frees the handle, as in RPP's GPU build | none (as in RPP, the stream given to `rppCreate` stays alive) | `fastrpp_errors_test` |
+| `rppt_resize_mirror_normalize` | `fastrpp::rppt_resize_mirror_normalize<BATCH>` | `BILINEAR`; U8 NHWC, 3 channels -> F32 NCHW, 3 channels, dense destination of at most 4 GiB; one output size for the batch | the last columns and rows; no clearing, no synchronisation; ROIs are checked and never modified; host-readable parameter arrays; accepts `nStride = 0` (shared-source batch) | `fastrpp_resize_mirror_normalize_vs_rpp_test`, `fastrpp_chain_vs_rpp_test` |
+| `rppt_channel_permute` | `fastrpp::rppt_channel_permute<BATCH>` | F32 NCHW, 3 channels -> F32 NCHW, 3 channels, dense, at most 4 GiB | only the six permutations; host-readable | `fastrpp_channel_permute_vs_rpp_test`, `fastrpp_chain_vs_rpp_test` |
 | none | `fastrpp::executeOperations` | chains: `rppt_resize_mirror_normalize` or `rppt_channel_permute`, then any number of `rppt_channel_permute` | none | every test |
 | none | `fastrpp::sharedSourceDesc` | the descriptor of a shared-source batch | FastRPP extension | `fastrpp_resize_mirror_normalize_vs_rpp_test`, `fastrpp_chain_vs_rpp_test` |
 
-Other data types, layouts and channel counts stop at a `static_assert`; the benchmark needs none of them.
+Naming another data type, layout or channel count in the template arguments stops at a `static_assert`. A run-time
+descriptor that does not match the template arguments returns `RPP_ERROR_INVALID_{SRC,DST}_{DATATYPE,LAYOUT,CHANNELS}`.
 
 ## Use
 
@@ -50,80 +51,111 @@ hipStreamSynchronize(stream);
 fastrpp::rppDestroy(handle, RppBackend::RPP_HIP_BACKEND);
 ```
 
-The arguments are RPP's, and so are the arrays: the same `RpptDesc`, `RpptROI`, mean, standard-deviation, mirror and
-permutation arrays work with RPP and with FastRPP. FastRPP needs RPP's headers (`rppdefs.h`) but not its library.
+The arguments are RPP's, and so are the types (`rppdefs.h`); FastRPP needs RPP's headers but not its library. To
+share parameter arrays with RPP:
+- use pinned host memory: RPP reads the arrays on the GPU, FastRPP reads them on the host;
+- give RPP its own ROI array: RPP rewrites XYWH ROIs as LTRB in place, and needs room for `256 * ceil(n / 256)` ROIs (below).
 
 ## Semantics
 
-### Operations and the template parameters
+### Template parameters
 
 FKL builds its kernels at compile time, but an `RpptDesc` holds the batch size, data type and layout only at run time. So each
 function takes them as template parameters, as FastNPP and cvGPUSpeedup do:
-- `BATCH`;
-- the types and layouts, in RPP's vocabulary, defaulted to the implemented combination.
 
-`BATCH` must equal `srcDesc->n`, `dstDesc->n` and the handle's batch size. RPP itself processes the handle's batch size.
+```cpp
+rppt_resize_mirror_normalize<BATCH, SRC_TYPE = U8, SRC_LAYOUT = NHWC, DST_TYPE = F32, DST_LAYOUT = NCHW, CHANNELS = 3,
+                             Impl = fastrpp::DefaultImplementation>
+rppt_channel_permute<BATCH, TYPE = F32, SRC_LAYOUT = NCHW, DST_LAYOUT = NCHW, CHANNELS = 3,
+                     Impl = fastrpp::DefaultImplementation>
+```
+
+`BATCH` must equal `srcDesc->n`, `dstDesc->n` and the handle's batch size; RPP itself processes the handle's batch size.
+`Impl` selects the implementation of the per-image mirror and permutation (see "Implementations").
 
 ### Execution
 
-- An operation records the first check that failed (`op.status`, an `RppStatus`).
-- `executeOperations` returns:
-  - that status;
-  - `RPP_ERROR_INVALID_ARGUMENTS` if the operations do not form a chain (each source pointer and descriptor must be the previous destination's);
-  - `RPP_ERROR_HIP_LAUNCH` if the launch fails.
+An operation records the first check that failed in `op.status`, an `RppStatus`. `executeOperations` launches one
+kernel on the stream of the handle given to it, and does not synchronise. Its result is the first of:
+- an operation's failed check;
+- `RPP_ERROR_INVALID_ARGUMENTS` for:
+  - a null handle;
+  - operations that do not form a chain (each source pointer and descriptor must be the previous destination's);
+  - a handle whose batch size is not `BATCH`.
 
-  After an error it launches nothing.
-- It does not synchronise the stream.
-- In a chain, the per-image work of every operation runs in the same thread. Only the last destination is written.
+  Nothing is launched in these cases.
+- `RPP_ERROR_HIP_LAUNCH` when a HIP error is pending after the launch. FKL checks `hipGetLastError()`, so the error
+  can also come from earlier work, and the kernel may have been enqueued.
+
+Every check and its status:
+
+| Check | Status |
+|---|---|
+| `executionBackend` is not `RPP_HIP_BACKEND`; interpolation is not `BILINEAR` | `RPP_ERROR_NOT_IMPLEMENTED` |
+| a null handle, pointer, descriptor or parameter array; `n` or the handle's batch size is not `BATCH`; a ROI type that is neither XYWH nor LTRB; a triple that is not a permutation | `RPP_ERROR_INVALID_ARGUMENTS` |
+| `numDims` is not 4 | `RPP_ERROR_INVALID_{SRC,DST}_DIMS` |
+| data type, layout or channels differ from the template arguments | `RPP_ERROR_INVALID_{SRC,DST}_{DATATYPE,LAYOUT,CHANNELS}` |
+| width or height 0; a permutation whose source and destination sizes differ | `RPP_ERROR_INVALID_DIM_LENGTHS` |
+| U8 source pixels not packed (`cStride` 1, `wStride` 3, `hStride >= 3 * w`); a destination (or permutation source) that is not dense (`RpptDesc`'s constructor strides; `nStride = 0` is rejected) | `RPP_ERROR_INVALID_{SRC,DST}_LAYOUT` |
+| an ROI not inside its image, or of width or height below 1 | `RPP_ERROR_OUT_OF_BOUND_SRC_ROI` |
+| per-image output sizes that differ from the destination's width and height; a float tensor over 4 GiB | `RPP_ERROR_NOT_IMPLEMENTED` |
 
 ### Shared-source batch
 
-FastRPP addresses image `i` of a source as RPP does: `(Rpp8u*)srcPtr + offsetInBytes + i * nStride` elements, the ROI
-of image `i` inside it. RPP 3.2.0 documents `nStride` as the distance between images. FastRPP also accepts
-`nStride = 0`: **n views of one image, each selected by its ROI**.
+RPP's kernels address image `i` of a source at `srcPtr + offsetInBytes + i * nStride` elements, with the ROI of image `i`
+inside it. RPP 3.2.0 does not document the stride fields, nor `nStride = 0`. FastRPP uses the same addressing and also
+accepts `nStride = 0`: **n views of one image, each selected by its ROI**.
 
 A batch of crops of one frame is then one descriptor (n crops, the frame's height and width) plus n ROIs, and FastRPP
 reads the crops in place, without copies. `fastrpp::sharedSourceDesc` builds that descriptor.
 
-As in RPP's dense batch, the bilinear neighbours of a crop are clamped to its ROI. So the result equals RPP's on the
-same crops copied into a dense batch, which is what the tests compare. A destination never has `nStride = 0`.
+The bilinear neighbours of a crop are clamped to its ROI, so FastRPP's result on a shared-source batch equals its result
+on the same crops copied into a dense batch. The tests compare it with RPP's result on that dense batch outside RPP's
+clamp region, where the two are bitwise equal. A destination never has `nStride = 0`.
 
 ### Parameter arrays and the handle
 
 - The ROI, mean, standard-deviation, mirror, permutation and output-size arrays are read on the host when the operation is built. Their values are copied into the kernel's parameters.
 - So they must be host-readable (pinned or pageable memory). Unlike RPP, which reads them on the GPU, they may change as soon as the function returns.
 - The ROI array is never modified.
-- `fastrpp::rppHandle_t` holds the batch size and the stream. It is not RPP's handle and allocates no memory.
+- `fastrpp::rppHandle_t` holds the batch size and the stream. It is not RPP's handle and allocates no device or scratch memory.
 
 ## Differences from RPP 3.2.0
 
 Each was checked against RPP's source (ROCm/rocm-libraries, tag `therock-10.1`, `projects/rpp`, version 3.2.0).
 
 - **The last columns and rows.** FastRPP samples at the pixel centres, the arithmetic of FKL's `ResizeHalfPixel`:
-  - `src = max((x + 0.5) * roiW / dstW - 0.5, 0)`;
+  - `src = max((x + 0.5) * roiW / dstW - 0.5, 0)` relative to the ROI;
   - `x1 = floor(src)`;
   - the second neighbour is clamped to the ROI's last column;
   - the same in y.
 
   RPP clamps both neighbours to `[0, roiW - 2]`, so it never reads the ROI's last column and row. Every output with
-  `floor(src) >= roiW - 2` (or the same in y) differs: for 60x120 -> 64x128, the last 2 columns and rows (by up to 126
-  on noise). A mirrored image has these columns on the left. FastRPP does not reproduce this; its tests require every
-  pixel within 1e-4 of a double-precision half-pixel reference.
-- **Source positions.** RPP computes `x * r + (r - 1) / 2` and FastRPP `(x + 0.5) * r - 0.5`, both in float. They give
-  the same positions when `roiW / dstW` and `roiH / dstH` are exact in binary (60/64, 120/128, 640/128...). Otherwise the
-  last bits differ, which on noisy images can exceed 1e-4.
+  `floor(src) >= roiW - 2` (or the same in y) differs: for 60x120 -> 64x128, the last 2 columns and rows. The
+  difference reaches up to 255 / stdDev on noise, 126 with fkl-benchmarks' parameters. A mirrored image has these
+  columns on the left. FastRPP does not reproduce this; its tests require every pixel within 1e-4 of a
+  double-precision half-pixel reference.
+- **Source positions.** RPP computes `x * r + (r - 1) / 2 + roiX` in float, in image coordinates; FastRPP computes
+  `(x + 0.5) * r - 0.5`, in float, relative to the ROI. They give the same positions when `roiW / dstW` and
+  `roiH / dstH` are exact in binary (60/64, 120/128, 640/128...) and the ROI origin is small. Otherwise the last bits
+  differ, by up to a few times 1e-5 in the tests. RPP's absolute coordinates also lose precision for ROIs far from the
+  image origin.
 - **No clearing, no synchronisation.** RPP's `rppt_resize_mirror_normalize` zeroes its whole destination and synchronises
   its stream before its kernel. FastRPP writes every destination pixel, so there is nothing to clear, and
   `executeOperations` is asynchronous.
+- **ROIs are checked.** An ROI outside its image, or of width or height below 1, gives `RPP_ERROR_OUT_OF_BOUND_SRC_ROI`.
+  RPP checks nothing, and reads outside the image.
 - **Mirror.** As in RPP, an image is mirrored only when `mirrorTensor[i] == 1`; other values are no mirror.
 - **Normalisation.** As in RPP: `(v - mean) * (1 / stdDev)`, `1 / stdDev` in float, with no 1/255 scaling from U8 to F32
   and no check of `stdDev`.
-- **Permutation.** As in RPP: output channel `k` is input channel `permutationTensor[3 * i + k]`. FastRPP rejects triples
-  that are not a permutation of 0, 1, 2; in RPP their result is undefined.
+- **Permutation.** As in RPP: output channel `k` is input channel `permutationTensor[3 * i + k]`.
+  - RPP documents the six permutations and checks nothing: a repeated index copies a channel there, and an index above 2 is undefined.
+  - FastRPP accepts only the six permutations and returns `RPP_ERROR_INVALID_ARGUMENTS` for any other triple.
 - **Output sizes.** Every `dstImgSizes[i]` must equal the destination's width and height (`RPP_ERROR_NOT_IMPLEMENTED`
   otherwise). FKL bounds the threads of a batch by its largest image.
-- **Dense destinations.** The destination tensor must have the strides `RpptDesc`'s constructor gives. FKL's planar
-  write puts channel `k` at `k * w * h` elements.
+- **Dense destinations of at most 4 GiB.** The destination tensor must have the strides `RpptDesc`'s constructor gives,
+  because FKL's planar write puts channel `k` at `k * w * h` elements. It must fit in 4 GiB, because FKL addresses
+  images with 32-bit byte offsets.
 
 Two defects of RPP 3.2.0 that a user of both libraries should know about (FastRPP has neither):
 - RPP's kernels write 8 pixels per thread and check only the first one. So an output width that is not a multiple of 8
@@ -134,11 +166,26 @@ Two defects of RPP 3.2.0 that a user of both libraries should know about (FastRP
 ## Implementations of the per-image mirror and permutation
 
 Both compute RPP's result. They differ in the code the GPU runs:
-- `fastrpp::UniformBranches`: the mirror and the six permutations are branches on a per-image value, uniform within a block.
+- `fastrpp::UniformBranches`, **the default**: the mirror and the six permutations are branches on a per-image value, uniform within a block.
 - `fastrpp::Selects`: the mirror selects the source column, and the permutation is FKL's `VectorReorderRT`, with run-time channel indices.
 
-The default, `fastrpp::DefaultImplementation`, is chosen by measurement: `tools/compare_implementations.hip` times both
-against fkl-benchmarks' `fkl_fused_halfpixel` chain. The result and the reason will be recorded here.
+The default was chosen by measurement. `tools/compare_implementations.hip` ran on an RX 9060 (gfx1200, ROCm 10.1) on
+2026-11-08, on fkl-benchmarks' pipeline (a): N crops of 60x120 resized to 64x128, normalised and permuted. The times are
+GPU time per launch, the median of 3 rotated rounds.
+
+| N | `fkl_fused_halfpixel` (FKL, hand-composed) | FastRPP `UniformBranches` | FastRPP `Selects` |
+|---|---|---|---|
+| 10 | 0.0139 ms | 0.0136 ms | 0.0141 ms |
+| 50 | 0.0293 ms | 0.0299 ms | 0.0340 ms |
+| 100 | 0.0450 ms | 0.0470 ms | 0.0536 ms |
+| 200 | 0.0764 ms | 0.0810 ms | 0.0954 ms |
+| 300 | 0.1096 ms | 0.1151 ms | 0.1378 ms |
+
+Results:
+- `UniformBranches` is never slower than `Selects`, and is within about 5% of the hand-composed FKL chain at N = 300 (`Selects`: +26%).
+- The difference with the hand-composed chain is the cost of RPP's per-image API: per-image constants and a run-time permutation, which double the kernel's parameter block (about 26 KB against about 14 KB at N = 300).
+- Per-image parameters that vary within the batch (mirror 0/1/2, all six permutations) give the same times.
+- Both implementations are bitwise equal to RPP outside its clamp region.
 
 ## Build
 
@@ -166,22 +213,23 @@ ctest --test-dir build --output-on-failure
 ## Tests
 
 Every public function is compared with RPP's own output on the same inputs. The tolerance is 1e-4 absolute, as in
-fkl-benchmarks; the test parameters keep the outputs below 256 in magnitude, where one float step is about 3e-5. The
-agreement machinery is that of fkl-benchmarks, with RPP's clamp region computed per image instead of "the last 2
-columns and rows".
+fkl-benchmarks; the test parameters keep the outputs below 256 in magnitude, where one float step is at most 2^-16
+(about 1.5e-5). The agreement machinery is that of fkl-benchmarks, with RPP's clamp region computed per image instead
+of "the last 2 columns and rows".
 
 | Test | What it checks |
 |---|---|
-| `fastrpp_compile_test` | every public path instantiated under the strict flags, both implementations |
-| `fastrpp_errors_test` | the handle, every documented status, and that nothing is launched after an error |
-| `fastrpp_resize_mirror_normalize_vs_rpp_test` | against RPP: 5 sizes, N = 1, 7, 300, noise and gradients, XYWH and LTRB, per-image mean, standard deviation and mirror (0, 1, 2), dense and shared-source batches, both implementations. Required: outside RPP's clamp region, and every pixel against the double reference. The case where `src / dst` is not exact in binary is informational |
+| `fastrpp_compile_test` | every public path instantiated under the strict flags, both implementations, and a three-operation chain that mixes them |
+| `fastrpp_errors_test` | the handle, the statuses of the table above, and that nothing is launched after an error. Both buffers a launch could write hold a sentinel. `RPP_ERROR_HIP_LAUNCH` is not provoked |
+| `fastrpp_resize_mirror_normalize_vs_rpp_test` | against RPP: 5 sizes, N = 1, 7, 300, noise and gradients, XYWH and LTRB, per-image mean, standard deviation and mirror (0, 1, 2), dense and shared-source batches, both implementations. Required: outside RPP's clamp region, and every pixel against the double reference. Where `src / dst` is not exact in binary, the RPP rows are informational and the reference is required within 1e-2. A FastRPP-only case checks the guard bands, with an output width that is not a multiple of 8, padded source rows and `offsetInBytes`, against the reference |
 | `fastrpp_channel_permute_vs_rpp_test` | against RPP, bitwise: the six permutations mixed within a batch, N = 6, 12, 300, both implementations |
-| `fastrpp_chain_vs_rpp_test` | the fused chain against RPP's two calls, on the benchmark's pipeline (a), N = 10 and 300: the benchmark's parameters, and parameters that differ per image (every permutation, mirror 0/1/2). The intermediate buffer must not be written |
+| `fastrpp_chain_vs_rpp_test` | the fused chain against RPP's calls, on the benchmark's pipeline (a), N = 10 and 300: the benchmark's parameters, and parameters that differ per image (every permutation, mirror 0/1/2). Also three operations with the two implementations mixed. The intermediate buffers must not be written |
 
 ## Continuous integration
 
 `.github/workflows/rocm.yml` builds and runs the tests on the self-hosted ROCm runner (`[self-hosted, linux, x64, rocm]`),
 for pull requests to `main` and by hand. That runner is also a benchmark machine, so the workflow never runs on a push.
+It runs one job per pull request, or per branch for manual runs.
 
 ## License
 
