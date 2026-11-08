@@ -1,0 +1,4 @@
+[submodule "fkl"]
+	path = fkl
+	url = https://github.com/Libraries-Openly-Fused/FusedKernelLibrary.git
+	branch = LTS-C++17
