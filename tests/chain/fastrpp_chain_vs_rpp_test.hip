@@ -12,14 +12,16 @@
    See the License for the specific language governing permissions and
    limitations under the License. */
 
-// The fused chain: fastrpp::executeOperations(handle, rppt_resize_mirror_normalize, rppt_channel_permute, rppt_copy),
-// one kernel, against RPP's two calls, on pipeline (a) of fkl-benchmarks (rpp/benchmark_rpp_preprocessing.h): N crops of
-// 60x120 at (i, i) of a 3840x2160 frame of the benchmark's seeded noise, resized to 64x128. FastRPP reads the crops in
-// place (shared-source batch); RPP reads them copied into a dense batch, RPP's documented batched form.
+// The fused chain: fastrpp::executeOperations(handle, backend, rppt_resize_mirror_normalize, rppt_channel_permute,
+// rppt_copy), one GPU kernel or FKL's CPU executor on host memory, against RPP's two calls on the same back-end, on
+// pipeline (a) of fkl-benchmarks (rpp/benchmark_rpp_preprocessing.h): N crops of 60x120 at (i, i) of a 3840x2160 frame
+// of the benchmark's seeded noise, resized to 64x128. FastRPP reads the crops in place (shared-source batch); RPP reads
+// them copied into a dense batch, RPP's documented batched form.
 //   benchmark parameters  the benchmark's: mean = sub / 0.3, stdDev = div / 0.3 in the source channel order, mirror 0,
 //                         permutation (2, 1, 0)
-//   mixed parameters      per image a different mean and standard deviation and a mirror flag of 0 or 2 (no mirror in
-//                         either library), and the permutation (1, 2, 0), which is not its own inverse
+//   mixed parameters      per image a different mean and standard deviation, a mirror flag of 0 or 2 on the HIP
+//                         back-end (no mirror in either library) and 0 on the host back-end (RPP's host back-end mirrors
+//                         on 2), and the permutation (1, 2, 0), which is not its own inverse
 // Rows as in fastrpp_resize_mirror_normalize_vs_rpp_test. The intermediate tensors (the destination of
 // rppt_resize_mirror_normalize, the source and destination of rppt_channel_permute) must not be written: only the write
 // IOp, rppt_copy's, writes memory.
@@ -38,16 +40,16 @@ constexpr uint32_t SENTINEL = 0xFFFFFFFFu; // the bytes the intermediate tensors
 
 // The crops of the frame copied into a dense batch, and their ROIs (each the whole crop): RPP's input
 struct RppInput {
-    Device<unsigned char> crops;
+    Buffer<unsigned char> crops;
     RpptDesc desc;
     Pinned<RpptROI> rois;
-    RppInput(const Device<unsigned char>& frame, const size_t n)
-        : crops(static_cast<size_t>(CROP_W) * CROP_H * 3 * n), desc(static_cast<Rpp32u>(n), 3, CROP_H, CROP_W, RpptDataType::U8, RpptLayout::NHWC),
-          rois(rppRoiCapacity(n)) {
+    RppInput(const Buffer<unsigned char>& frame, const size_t n)
+        : crops(static_cast<size_t>(CROP_W) * CROP_H * 3 * n, frame.backend()),
+          desc(static_cast<Rpp32u>(n), 3, CROP_H, CROP_W, RpptDataType::U8, RpptLayout::NHWC), rois(rppRoiCapacity(n)) {
         const size_t cropBytes = static_cast<size_t>(CROP_W) * CROP_H * 3;
         for (size_t i = 0; i < n; ++i) {
-            FASTRPP_TEST_HIP(hipMemcpy2D(crops.data() + cropBytes * i, static_cast<size_t>(CROP_W) * 3, frame.data() + (i * SRC_W + i) * 3,
-                                         static_cast<size_t>(SRC_W) * 3, static_cast<size_t>(CROP_W) * 3, CROP_H, hipMemcpyDeviceToDevice));
+            copy2D(frame.backend(), crops.data() + cropBytes * i, static_cast<size_t>(CROP_W) * 3, frame.data() + (i * SRC_W + i) * 3,
+                   static_cast<size_t>(SRC_W) * 3, static_cast<size_t>(CROP_W) * 3, CROP_H);
             rois[i].xywhROI = {{0, 0}, CROP_W, CROP_H};
         }
     }
@@ -63,7 +65,7 @@ struct Parameters {
     Pinned<RpptImagePatch> sizes{N};
     std::vector<RpptROI> rois = std::vector<RpptROI>(N);
 
-    Parameters(const std::vector<unsigned char>& frameHost, const bool mixed, const uint32_t (&perm)[3]) {
+    Parameters(const std::vector<unsigned char>& frameHost, const bool mixed, const uint32_t (&perm)[3], const RppBackend backend) {
         for (size_t i = 0; i < N; ++i) {
             ImageSpec& s = specs[i];
             s.image = frameHost.data();
@@ -85,14 +87,15 @@ struct Parameters {
                 mean[3 * i + c] = s.mean[c];
                 stdDev[3 * i + c] = s.stdDev[c];
             }
-            mirror[i] = mixed ? static_cast<Rpp32u>((i % 2) * 2) : 0u;
+            mirror[i] = mixed && backend == RppBackend::RPP_HIP_BACKEND ? static_cast<Rpp32u>((i % 2) * 2) : 0u;
             sizes[i] = RpptImagePatch{OUT_W, OUT_H};
             rois[i].xywhROI = {{s.roiX, s.roiY}, CROP_W, CROP_H};
         }
     }
 };
 
-void rows(Report& report, const std::vector<ImageSpec>& specs, const std::vector<float>& fast, const std::vector<float>& rpp) {
+void rows(Report& report, const std::vector<ImageSpec>& specs, const std::vector<float>& fast, const std::vector<float>& rpp,
+          const RppBackend backend) {
     const size_t n = specs.size();
     const size_t imageValues = 3 * static_cast<size_t>(OUT_W) * OUT_H;
     std::vector<double> expected(n * imageValues);
@@ -102,19 +105,29 @@ void rows(Report& report, const std::vector<ImageSpec>& specs, const std::vector
     auto inClampRegion = [&](const size_t i, const int x, const int y) { return rppEdge(specs[i], OUT_W, OUT_H, x, y); };
     auto outsideClampRegion = [&](const size_t i, const int x, const int y) { return !rppEdge(specs[i], OUT_W, OUT_H, x, y); };
     auto everywhere = [](const size_t, const int, const int) { return true; };
-    report.row("FastRPP vs RPP, outside RPP's clamp region", compare(fast.data(), rpp.data(), n, OUT_W, OUT_H, outsideClampRegion), true);
-    report.row("FastRPP vs RPP, in RPP's clamp region", compare(fast.data(), rpp.data(), n, OUT_W, OUT_H, inClampRegion), false);
+    if (backend == RppBackend::RPP_HIP_BACKEND) {
+        report.row("FastRPP vs RPP, outside RPP's clamp region", compare(fast.data(), rpp.data(), n, OUT_W, OUT_H, outsideClampRegion), true);
+        report.row("FastRPP vs RPP, in RPP's clamp region", compare(fast.data(), rpp.data(), n, OUT_W, OUT_H, inClampRegion), false);
+    } else {
+        report.row("FastRPP vs RPP, every pixel (RPP's host kernels have no clamp region)",
+                   compare(fast.data(), rpp.data(), n, OUT_W, OUT_H, everywhere), true);
+    }
     report.row("FastRPP vs the double half-pixel reference, every pixel", compare(fast.data(), expected.data(), n, OUT_W, OUT_H, everywhere), true);
-    report.row("RPP vs the double half-pixel reference, outside RPP's clamp region",
-               compare(rpp.data(), expected.data(), n, OUT_W, OUT_H, outsideClampRegion), false);
+    if (backend == RppBackend::RPP_HIP_BACKEND) {
+        report.row("RPP vs the double half-pixel reference, outside RPP's clamp region",
+                   compare(rpp.data(), expected.data(), n, OUT_W, OUT_H, outsideClampRegion), false);
+    } else {
+        report.row("RPP vs the double half-pixel reference, every pixel", compare(rpp.data(), expected.data(), n, OUT_W, OUT_H, everywhere), false);
+    }
 }
 
 template <size_t N>
-void runCase(Report& report, const std::vector<unsigned char>& frameHost, const Device<unsigned char>& frame, const bool mixed) {
-    std::cout << "chain rppt_resize_mirror_normalize -> rppt_channel_permute -> rppt_copy, pipeline (a), N " << N << ", "
-              << (mixed ? "mixed per-image parameters, permutation (1, 2, 0)" : "the benchmark's parameters") << std::endl;
+void runCase(Report& report, const std::vector<unsigned char>& frameHost, const Buffer<unsigned char>& frame, const bool mixed) {
+    const RppBackend backend = frame.backend();
+    std::cout << backendName(backend) << ": chain rppt_resize_mirror_normalize -> rppt_channel_permute -> rppt_copy, pipeline (a), N " << N
+              << ", " << (mixed ? "mixed per-image parameters, permutation (1, 2, 0)" : "the benchmark's parameters") << std::endl;
     const uint32_t perms[2][3] = {{2, 1, 0}, {1, 2, 0}}; // the benchmark's, the mixed case's
-    Parameters<N> prm(frameHost, mixed, perms[mixed ? 1 : 0]);
+    Parameters<N> prm(frameHost, mixed, perms[mixed ? 1 : 0], backend);
     Pinned<Rpp32u> permutation(3 * N);
     for (size_t i = 0; i < N; ++i) {
         for (size_t c = 0; c < 3; ++c) {
@@ -128,53 +141,50 @@ void runCase(Report& report, const std::vector<unsigned char>& frameHost, const 
 
     // FastRPP: the frame in place, three IOps, one kernel
     RpptDesc frameDesc = fastrpp::sharedSourceDesc(N, 3, SRC_H, SRC_W, RpptDataType::U8, RpptLayout::NHWC, SRC_W * 3);
-    Device<float> resized(outCount), permuted(outCount), fastOut(outCount);
+    Buffer<float> resized(outCount, backend), permuted(outCount, backend), fastOut(outCount, backend);
     resized.fillBytes(0xFF);
     permuted.fillBytes(0xFF);
     fastOut.fillBytes(0xFF);
-    fastrpp::rppHandle_t fastHandle{};
-    FASTRPP_TEST_RPP(fastrpp::rppCreate(&fastHandle, N, 0, stream, RppBackend::RPP_HIP_BACKEND));
+    const rppHandle_t fastHandle = createHandle(N, backend, stream);
     const auto rmn = fastrpp::rppt_resize_mirror_normalize<N>(frame.data(), &frameDesc, resized.data(), &outDesc, prm.sizes.data(),
                                                               RpptInterpolationType::BILINEAR, prm.mean.data(), prm.stdDev.data(),
-                                                              prm.mirror.data(), prm.rois.data(), RpptRoiType::XYWH, fastHandle,
-                                                              RppBackend::RPP_HIP_BACKEND);
-    const auto cp = fastrpp::rppt_channel_permute(resized.data(), &outDesc, permuted.data(), &outDesc, permutation.data(), fastHandle,
-                                                  RppBackend::RPP_HIP_BACKEND);
-    const auto copy = fastrpp::rppt_copy(permuted.data(), &outDesc, fastOut.data(), &outDesc, fastHandle, RppBackend::RPP_HIP_BACKEND);
-    fastrpp::executeOperations(fastHandle, rmn, cp, copy);
+                                                              prm.mirror.data(), prm.rois.data(), RpptRoiType::XYWH);
+    const auto cp = fastrpp::rppt_channel_permute(resized.data(), &outDesc, permuted.data(), &outDesc, permutation.data());
+    const auto copy = fastrpp::rppt_copy(permuted.data(), &outDesc, fastOut.data(), &outDesc);
+    fastrpp::executeOperations(fastHandle, backend, rmn, cp, copy);
     FASTRPP_TEST_HIP(hipStreamSynchronize(stream));
     const std::vector<float> fast = fastOut.download();
     report.check("the intermediate tensors are not written", holdsSentinel(resized.download(), SENTINEL) && holdsSentinel(permuted.download(), SENTINEL));
-    FASTRPP_TEST_RPP(fastrpp::rppDestroy(fastHandle, RppBackend::RPP_HIP_BACKEND));
+    FASTRPP_TEST_RPP(rppDestroy(fastHandle, backend));
 
     // RPP: the crops copied into a dense batch, then its two calls
     RppInput in(frame, N);
-    Device<float> rppResized(outCount), rppOut(outCount);
-    rppHandle_t rppHandle{};
-    FASTRPP_TEST_RPP(rppCreate(&rppHandle, N, 0, stream, RppBackend::RPP_HIP_BACKEND));
+    Buffer<float> rppResized(outCount, backend), rppOut(outCount, backend);
+    const rppHandle_t rppHandle = createHandle(N, backend, stream);
     FASTRPP_TEST_RPP(rppt_resize_mirror_normalize(in.crops.data(), &in.desc, rppResized.data(), &outDesc, prm.sizes.data(),
                                                   RpptInterpolationType::BILINEAR, prm.mean.data(), prm.stdDev.data(), prm.mirror.data(),
-                                                  in.rois.data(), RpptRoiType::XYWH, rppHandle, RppBackend::RPP_HIP_BACKEND));
-    FASTRPP_TEST_RPP(rppt_channel_permute(rppResized.data(), &outDesc, rppOut.data(), &outDesc, permutation.data(), rppHandle,
-                                          RppBackend::RPP_HIP_BACKEND));
+                                                  in.rois.data(), RpptRoiType::XYWH, rppHandle, backend));
+    FASTRPP_TEST_RPP(rppt_channel_permute(rppResized.data(), &outDesc, rppOut.data(), &outDesc, permutation.data(), rppHandle, backend));
     FASTRPP_TEST_HIP(hipStreamSynchronize(stream));
     const std::vector<float> rpp = rppOut.download();
-    FASTRPP_TEST_RPP(rppDestroy(rppHandle, RppBackend::RPP_HIP_BACKEND));
+    FASTRPP_TEST_RPP(rppDestroy(rppHandle, backend));
     FASTRPP_TEST_HIP(hipStreamDestroy(stream));
-    rows(report, prm.specs, fast, rpp);
+    rows(report, prm.specs, fast, rpp, backend);
 }
 
 // Two permutations: rppt_resize_mirror_normalize -> rppt_channel_permute (P1) -> rppt_channel_permute (P2) -> rppt_copy,
 // one kernel, against RPP's three calls; mixed per-image parameters. Output channel k is the normalised channel
 // P1[P2[k]]; none of the three intermediate tensors may be written.
 template <size_t N>
-void runTwoPermutations(Report& report, const std::vector<unsigned char>& frameHost, const Device<unsigned char>& frame) {
+void runTwoPermutations(Report& report, const std::vector<unsigned char>& frameHost, const Buffer<unsigned char>& frame) {
+    const RppBackend backend = frame.backend();
     const uint32_t a[3] = {1, 2, 0}, b[3] = {0, 2, 1};
-    std::cout << "chain rppt_resize_mirror_normalize -> rppt_channel_permute (1, 2, 0) -> rppt_channel_permute (0, 2, 1) -> rppt_copy, "
+    std::cout << backendName(backend)
+              << ": chain rppt_resize_mirror_normalize -> rppt_channel_permute (1, 2, 0) -> rppt_channel_permute (0, 2, 1) -> rppt_copy, "
                  "pipeline (a), N "
               << N << ", mixed per-image parameters" << std::endl;
     const uint32_t combined[3] = {a[b[0]], a[b[1]], a[b[2]]};
-    Parameters<N> prm(frameHost, true, combined);
+    Parameters<N> prm(frameHost, true, combined, backend);
     Pinned<Rpp32u> p1(3 * N), p2(3 * N);
     for (size_t i = 0; i < N; ++i) {
         for (size_t c = 0; c < 3; ++c) {
@@ -188,41 +198,38 @@ void runTwoPermutations(Report& report, const std::vector<unsigned char>& frameH
     FASTRPP_TEST_HIP(hipStreamCreate(&stream));
 
     RpptDesc frameDesc = fastrpp::sharedSourceDesc(N, 3, SRC_H, SRC_W, RpptDataType::U8, RpptLayout::NHWC, SRC_W * 3);
-    Device<float> mid1(outCount), mid2(outCount), mid3(outCount), fastOut(outCount);
-    for (Device<float>* buffer : {&mid1, &mid2, &mid3, &fastOut}) {
+    Buffer<float> mid1(outCount, backend), mid2(outCount, backend), mid3(outCount, backend), fastOut(outCount, backend);
+    for (Buffer<float>* buffer : {&mid1, &mid2, &mid3, &fastOut}) {
         buffer->fillBytes(0xFF);
     }
-    fastrpp::rppHandle_t fastHandle{};
-    FASTRPP_TEST_RPP(fastrpp::rppCreate(&fastHandle, N, 0, stream, RppBackend::RPP_HIP_BACKEND));
+    const rppHandle_t fastHandle = createHandle(N, backend, stream);
     const auto rmn = fastrpp::rppt_resize_mirror_normalize<N>(frame.data(), &frameDesc, mid1.data(), &outDesc, prm.sizes.data(),
                                                               RpptInterpolationType::BILINEAR, prm.mean.data(), prm.stdDev.data(),
-                                                              prm.mirror.data(), prm.rois.data(), RpptRoiType::XYWH, fastHandle,
-                                                              RppBackend::RPP_HIP_BACKEND);
-    const auto cp1 = fastrpp::rppt_channel_permute(mid1.data(), &outDesc, mid2.data(), &outDesc, p1.data(), fastHandle, RppBackend::RPP_HIP_BACKEND);
-    const auto cp2 = fastrpp::rppt_channel_permute(mid2.data(), &outDesc, mid3.data(), &outDesc, p2.data(), fastHandle, RppBackend::RPP_HIP_BACKEND);
-    const auto copy = fastrpp::rppt_copy(mid3.data(), &outDesc, fastOut.data(), &outDesc, fastHandle, RppBackend::RPP_HIP_BACKEND);
-    fastrpp::executeOperations(fastHandle, rmn, cp1, cp2, copy);
+                                                              prm.mirror.data(), prm.rois.data(), RpptRoiType::XYWH);
+    const auto cp1 = fastrpp::rppt_channel_permute(mid1.data(), &outDesc, mid2.data(), &outDesc, p1.data());
+    const auto cp2 = fastrpp::rppt_channel_permute(mid2.data(), &outDesc, mid3.data(), &outDesc, p2.data());
+    const auto copy = fastrpp::rppt_copy(mid3.data(), &outDesc, fastOut.data(), &outDesc);
+    fastrpp::executeOperations(fastHandle, backend, rmn, cp1, cp2, copy);
     FASTRPP_TEST_HIP(hipStreamSynchronize(stream));
     const std::vector<float> fast = fastOut.download();
     report.check("none of the three intermediate tensors is written", holdsSentinel(mid1.download(), SENTINEL) &&
                                                                           holdsSentinel(mid2.download(), SENTINEL) &&
                                                                           holdsSentinel(mid3.download(), SENTINEL));
-    FASTRPP_TEST_RPP(fastrpp::rppDestroy(fastHandle, RppBackend::RPP_HIP_BACKEND));
+    FASTRPP_TEST_RPP(rppDestroy(fastHandle, backend));
 
     RppInput in(frame, N);
-    Device<float> r1(outCount), r2(outCount), rppOut(outCount);
-    rppHandle_t rppHandle{};
-    FASTRPP_TEST_RPP(rppCreate(&rppHandle, N, 0, stream, RppBackend::RPP_HIP_BACKEND));
+    Buffer<float> r1(outCount, backend), r2(outCount, backend), rppOut(outCount, backend);
+    const rppHandle_t rppHandle = createHandle(N, backend, stream);
     FASTRPP_TEST_RPP(rppt_resize_mirror_normalize(in.crops.data(), &in.desc, r1.data(), &outDesc, prm.sizes.data(), RpptInterpolationType::BILINEAR,
                                                   prm.mean.data(), prm.stdDev.data(), prm.mirror.data(), in.rois.data(), RpptRoiType::XYWH,
-                                                  rppHandle, RppBackend::RPP_HIP_BACKEND));
-    FASTRPP_TEST_RPP(rppt_channel_permute(r1.data(), &outDesc, r2.data(), &outDesc, p1.data(), rppHandle, RppBackend::RPP_HIP_BACKEND));
-    FASTRPP_TEST_RPP(rppt_channel_permute(r2.data(), &outDesc, rppOut.data(), &outDesc, p2.data(), rppHandle, RppBackend::RPP_HIP_BACKEND));
+                                                  rppHandle, backend));
+    FASTRPP_TEST_RPP(rppt_channel_permute(r1.data(), &outDesc, r2.data(), &outDesc, p1.data(), rppHandle, backend));
+    FASTRPP_TEST_RPP(rppt_channel_permute(r2.data(), &outDesc, rppOut.data(), &outDesc, p2.data(), rppHandle, backend));
     FASTRPP_TEST_HIP(hipStreamSynchronize(stream));
     const std::vector<float> rpp = rppOut.download();
-    FASTRPP_TEST_RPP(rppDestroy(rppHandle, RppBackend::RPP_HIP_BACKEND));
+    FASTRPP_TEST_RPP(rppDestroy(rppHandle, backend));
     FASTRPP_TEST_HIP(hipStreamDestroy(stream));
-    rows(report, prm.specs, fast, rpp);
+    rows(report, prm.specs, fast, rpp, backend);
 }
 
 } // namespace
@@ -231,14 +238,16 @@ int main() {
     try {
         // The benchmark's frame: seeded noise (LCG, seed 12345), dense rows
         const std::vector<unsigned char> frameHost = noiseImage(SRC_W, SRC_H, 12345u);
-        Device<unsigned char> frame(frameHost.size());
-        frame.upload(frameHost);
         Report report;
-        for (const bool mixed : {false, true}) {
-            runCase<10>(report, frameHost, frame, mixed);
-            runCase<300>(report, frameHost, frame, mixed);
+        for (const RppBackend backend : BACKENDS) {
+            Buffer<unsigned char> frame(frameHost.size(), backend);
+            frame.upload(frameHost);
+            for (const bool mixed : {false, true}) {
+                runCase<10>(report, frameHost, frame, mixed);
+                runCase<300>(report, frameHost, frame, mixed);
+            }
+            runTwoPermutations<10>(report, frameHost, frame);
         }
-        runTwoPermutations<10>(report, frameHost, frame);
         return report.exitCode();
     } catch (const std::exception& e) {
         std::cout << "EXCEPTION: " << e.what() << std::endl;

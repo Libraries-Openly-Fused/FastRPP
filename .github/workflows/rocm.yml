@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          submodules: true
+          submodules: recursive
 
       - name: Check the FKL pin (LTS-C++17)
         run: |

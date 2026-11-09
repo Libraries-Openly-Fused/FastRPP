@@ -29,6 +29,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -74,34 +75,91 @@ private:
     size_t count_;
 };
 
+// The memory of a test tensor for an execution back-end: device memory (hipMalloc) for RPP_HIP_BACKEND, pageable host
+// memory for RPP_HOST_BACKEND (what a host application gives RPP's host back-end)
 template <typename T>
-class Device {
+class Buffer {
 public:
-    explicit Device(const size_t count) : count_(count) {
-        FASTRPP_TEST_HIP(hipMalloc(reinterpret_cast<void**>(&data_), sizeof(T) * std::max<size_t>(count, 1)));
+    explicit Buffer(const size_t count, const RppBackend backend = RppBackend::RPP_HIP_BACKEND) : count_(count), backend_(backend) {
+        if (backend_ == RppBackend::RPP_HIP_BACKEND) {
+            FASTRPP_TEST_HIP(hipMalloc(reinterpret_cast<void**>(&data_), sizeof(T) * std::max<size_t>(count, 1)));
+        } else {
+            host_ = std::make_unique<T[]>(std::max<size_t>(count, 1));
+            data_ = host_.get();
+        }
     }
+    ~Buffer() {
+        if (backend_ == RppBackend::RPP_HIP_BACKEND) {
+            static_cast<void>(hipFree(data_));
+        }
+    }
+    Buffer(const Buffer&) = delete;
+    Buffer& operator=(const Buffer&) = delete;
     // Raw bytes of the allocation (for guard bands and byte offsets)
     unsigned char* bytesPtr() const { return reinterpret_cast<unsigned char*>(data_); }
-    ~Device() { static_cast<void>(hipFree(data_)); }
-    Device(const Device&) = delete;
-    Device& operator=(const Device&) = delete;
     T* data() const { return data_; }
     size_t size() const { return count_; }
     size_t bytes() const { return sizeof(T) * count_; }
+    RppBackend backend() const { return backend_; }
     void upload(const std::vector<T>& host) {
-        FASTRPP_TEST_HIP(hipMemcpy(data_, host.data(), sizeof(T) * std::min(count_, host.size()), hipMemcpyHostToDevice));
+        const size_t n = sizeof(T) * std::min(count_, host.size());
+        if (backend_ == RppBackend::RPP_HIP_BACKEND) {
+            FASTRPP_TEST_HIP(hipMemcpy(data_, host.data(), n, hipMemcpyHostToDevice));
+        } else {
+            std::memcpy(data_, host.data(), n);
+        }
     }
     std::vector<T> download() const {
         std::vector<T> host(count_);
-        FASTRPP_TEST_HIP(hipMemcpy(host.data(), data_, bytes(), hipMemcpyDeviceToHost));
+        if (backend_ == RppBackend::RPP_HIP_BACKEND) {
+            FASTRPP_TEST_HIP(hipMemcpy(host.data(), data_, bytes(), hipMemcpyDeviceToHost));
+        } else {
+            std::memcpy(host.data(), data_, bytes());
+        }
         return host;
     }
-    void fillBytes(const int value) { FASTRPP_TEST_HIP(hipMemset(data_, value, bytes())); }
+    void fillBytes(const int value) {
+        if (backend_ == RppBackend::RPP_HIP_BACKEND) {
+            FASTRPP_TEST_HIP(hipMemset(data_, value, bytes()));
+        } else {
+            std::memset(data_, value, bytes());
+        }
+    }
 
 private:
     T* data_{nullptr};
     size_t count_;
+    RppBackend backend_;
+    std::unique_ptr<T[]> host_;
 };
+
+// Device memory, the default of Buffer
+template <typename T>
+using Device = Buffer<T>;
+
+// The two execution back-ends every comparison runs on
+constexpr RppBackend BACKENDS[] = {RppBackend::RPP_HIP_BACKEND, RppBackend::RPP_HOST_BACKEND};
+
+inline const char* backendName(const RppBackend backend) { return backend == RppBackend::RPP_HIP_BACKEND ? "HIP back-end" : "host back-end"; }
+
+// RPP's handle for a back-end: on stream for RPP_HIP_BACKEND; a host handle has no stream
+inline rppHandle_t createHandle(const size_t n, const RppBackend backend, const hipStream_t stream) {
+    rppHandle_t handle{};
+    FASTRPP_TEST_RPP(rppCreate(&handle, n, 0, backend == RppBackend::RPP_HIP_BACKEND ? stream : nullptr, backend));
+    return handle;
+}
+
+// A 2D copy inside the memory of one back-end (crops of a frame into a dense batch)
+inline void copy2D(const RppBackend backend, void* const dst, const size_t dstPitch, const void* const src, const size_t srcPitch,
+                   const size_t widthBytes, const size_t height) {
+    if (backend == RppBackend::RPP_HIP_BACKEND) {
+        FASTRPP_TEST_HIP(hipMemcpy2D(dst, dstPitch, src, srcPitch, widthBytes, height, hipMemcpyDeviceToDevice));
+    } else {
+        for (size_t r = 0; r < height; ++r) {
+            std::memcpy(static_cast<unsigned char*>(dst) + r * dstPitch, static_cast<const unsigned char*>(src) + r * srcPitch, widthBytes);
+        }
+    }
+}
 
 // RPP 3.2.0's XYWH -> LTRB conversion kernel runs 256 * ceil(n / 256) threads with no bounds check, each rewriting one
 // ROI: an ROI array given to RPP must hold that many ROIs

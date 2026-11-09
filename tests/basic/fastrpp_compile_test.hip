@@ -14,11 +14,14 @@
 
 // Every public path of fast_rpp.h instantiated under the strict flags; nothing runs on the GPU (as FastNPP's basic
 // test). Each function, with its template defaults and with explicit template arguments, must return exactly the IOp
-// written below with FKL alone: FastRPP defines no operation and only translates RPP's arguments into FKL's. The chains
-// executeOperations runs are instantiated, kernels included.
+// written below with FKL alone: FastRPP defines no operation and only translates RPP's arguments into FKL's. Its
+// parameters must be those RPP 3.2.0 declares for the function, without the handle and the back-end; executeOperations
+// alone takes RPP's own rppHandle_t and RppBackend. The chains executeOperations runs are instantiated on both
+// back-ends: the GPU kernels and FKL's CPU executor.
 #include <fast_rpp.h>
 
 #include <array>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 
@@ -42,12 +45,11 @@ template <size_t N>
 using RMN = decltype(fastrpp::rppt_resize_mirror_normalize<N>(
     std::declval<RppPtr_t>(), std::declval<RpptDescPtr>(), std::declval<RppPtr_t>(), std::declval<RpptDescPtr>(), std::declval<RpptImagePatchPtr>(),
     std::declval<RpptInterpolationType>(), std::declval<Rpp32f*>(), std::declval<Rpp32f*>(), std::declval<Rpp32u*>(), std::declval<RpptROIPtr>(),
-    std::declval<RpptRoiType>(), std::declval<fastrpp::rppHandle_t>(), std::declval<RppBackend>()));
+    std::declval<RpptRoiType>()));
 using CP = decltype(fastrpp::rppt_channel_permute(std::declval<RppPtr_t>(), std::declval<RpptDescPtr>(), std::declval<RppPtr_t>(),
-                                                  std::declval<RpptDescPtr>(), std::declval<Rpp32u*>(), std::declval<fastrpp::rppHandle_t>(),
-                                                  std::declval<RppBackend>()));
-using Copy = decltype(fastrpp::rppt_copy(std::declval<RppPtr_t>(), std::declval<RpptDescPtr>(), std::declval<RppPtr_t>(), std::declval<RpptDescPtr>(),
-                                         std::declval<fastrpp::rppHandle_t>(), std::declval<RppBackend>()));
+                                                  std::declval<RpptDescPtr>(), std::declval<Rpp32u*>()));
+using Copy =
+    decltype(fastrpp::rppt_copy(std::declval<RppPtr_t>(), std::declval<RpptDescPtr>(), std::declval<RppPtr_t>(), std::declval<RpptDescPtr>()));
 
 static_assert(std::is_same_v<RMN<1>, ExpectedRMN<1>> && std::is_same_v<RMN<300>, ExpectedRMN<300>>,
               "rppt_resize_mirror_normalize returns FKL's BatchRead of PerThreadRead -> ResizeHalfPixel -> Sub -> Mul");
@@ -62,25 +64,61 @@ static_assert(std::is_same_v<decltype(fastrpp::rppt_resize_mirror_normalize<300,
                                                                               RpptLayout::NCHW, 3>(
                                  std::declval<RppPtr_t>(), std::declval<RpptDescPtr>(), std::declval<RppPtr_t>(), std::declval<RpptDescPtr>(),
                                  std::declval<RpptImagePatchPtr>(), std::declval<RpptInterpolationType>(), std::declval<Rpp32f*>(),
-                                 std::declval<Rpp32f*>(), std::declval<Rpp32u*>(), std::declval<RpptROIPtr>(), std::declval<RpptRoiType>(),
-                                 std::declval<fastrpp::rppHandle_t>(), std::declval<RppBackend>())),
+                                 std::declval<Rpp32f*>(), std::declval<Rpp32u*>(), std::declval<RpptROIPtr>(), std::declval<RpptRoiType>())),
                              RMN<300>>,
               "explicit template arguments");
 static_assert(std::is_same_v<decltype(fastrpp::rppt_channel_permute<RpptDataType::F32, RpptLayout::NCHW, RpptLayout::NCHW, 3>(
                                  std::declval<RppPtr_t>(), std::declval<RpptDescPtr>(), std::declval<RppPtr_t>(), std::declval<RpptDescPtr>(),
-                                 std::declval<Rpp32u*>(), std::declval<fastrpp::rppHandle_t>(), std::declval<RppBackend>())),
+                                 std::declval<Rpp32u*>())),
                              CP>,
               "explicit template arguments");
 static_assert(std::is_same_v<decltype(fastrpp::rppt_copy<RpptDataType::F32, RpptLayout::NCHW, RpptLayout::NCHW, 3>(
-                                 std::declval<RppPtr_t>(), std::declval<RpptDescPtr>(), std::declval<RppPtr_t>(), std::declval<RpptDescPtr>(),
-                                 std::declval<fastrpp::rppHandle_t>(), std::declval<RppBackend>())),
+                                 std::declval<RppPtr_t>(), std::declval<RpptDescPtr>(), std::declval<RppPtr_t>(), std::declval<RpptDescPtr>())),
                              Copy>,
               "explicit template arguments");
 
+// The parameters: RPP's declaration of the function (rppt_*.h, extern "C") without its rppHandle_t and its RppBackend
+template <typename F>
+struct ParametersOf;
+template <typename R, typename... Args>
+struct ParametersOf<R (*)(Args...)> {
+    using type = std::tuple<Args...>;
+};
+template <typename T>
+constexpr bool isHandleOrBackend = std::is_same_v<T, rppHandle_t> || std::is_same_v<T, RppBackend>;
+template <typename F>
+struct ParametersWithoutHandleAndBackend;
+template <typename R, typename... Args>
+struct ParametersWithoutHandleAndBackend<R (*)(Args...)> {
+    using type = decltype(std::tuple_cat(std::declval<std::conditional_t<isHandleOrBackend<Args>, std::tuple<>, std::tuple<Args>>>()...));
+};
+template <typename FastRpp, typename Rpp>
+constexpr bool rppParametersWithoutHandleAndBackend =
+    std::is_same_v<typename ParametersOf<FastRpp>::type, typename ParametersWithoutHandleAndBackend<Rpp>::type> &&
+    std::tuple_size_v<typename ParametersOf<FastRpp>::type> + 2 == std::tuple_size_v<typename ParametersOf<Rpp>::type>;
+
+static_assert(rppParametersWithoutHandleAndBackend<decltype(&fastrpp::rppt_resize_mirror_normalize<300>),
+                                                   decltype(&::rppt_resize_mirror_normalize)>,
+              "rppt_resize_mirror_normalize takes RPP's parameters without the handle and the back-end");
+static_assert(rppParametersWithoutHandleAndBackend<decltype(&fastrpp::rppt_channel_permute<>), decltype(&::rppt_channel_permute)>,
+              "rppt_channel_permute takes RPP's parameters without the handle and the back-end");
+static_assert(rppParametersWithoutHandleAndBackend<decltype(&fastrpp::rppt_copy<>), decltype(&::rppt_copy)>,
+              "rppt_copy takes RPP's parameters without the handle and the back-end");
+
 // The chains executeOperations runs; an FKL read of the caller's can start one (fk::TensorPack of an F32 NCHW tensor)
 using PackRead = decltype(fk::TensorPack<fk::float3>::build(std::declval<TensorView>()));
-static_assert(std::is_same_v<decltype(fastrpp::executeOperations(std::declval<fastrpp::rppHandle_t>(), std::declval<const RMN<300>&>(),
-                                                                 std::declval<const CP&>(), std::declval<const Copy&>())),
+static_assert(std::is_same_v<decltype(&fastrpp::executeOperations<RMN<300>, CP, Copy>),
+                             void (*)(rppHandle_t, RppBackend, const RMN<300>&, const CP&, const Copy&)>,
+              "executeOperations takes RPP's own rppHandle_t and RppBackend, and the IOps");
+// RPP_HOST_BACKEND runs on FKL's multithreaded CPU executor when the build enables it (FASTRPP_CPU_MULTITHREAD)
+#if defined(FK_CPU_MULTITHREAD_ENABLED)
+static_assert(fastrpp::detail::HOST_PAR_ARCH == fk::ParArch::CPU_MULTITHREAD, "RPP_HOST_BACKEND on FKL's CPU_MULTITHREAD");
+#else
+static_assert(fastrpp::detail::HOST_PAR_ARCH == fk::ParArch::CPU, "RPP_HOST_BACKEND on FKL's CPU");
+#endif
+static_assert(std::is_same_v<decltype(fastrpp::executeOperations(std::declval<rppHandle_t>(), std::declval<RppBackend>(),
+                                                                 std::declval<const RMN<300>&>(), std::declval<const CP&>(),
+                                                                 std::declval<const Copy&>())),
                              void>,
               "executeOperations returns nothing: errors are exceptions");
 static_assert(std::is_base_of_v<std::runtime_error, fastrpp::Error>, "fastrpp::Error is a std::runtime_error");

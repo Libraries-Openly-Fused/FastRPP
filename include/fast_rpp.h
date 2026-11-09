@@ -18,24 +18,30 @@
 // FastRPP: functions of AMD's RPP tensor API (rppt_*, RPP 3.2.0) as operations of the Fused Kernel Library (FKL), HIP
 // only, in the way FastNPP offers NPP's functions.
 //
-// Each fastrpp::rppt_* function takes RPP's arguments, checks them on the host, translates RPP's objects (descriptors,
-// ROIs, parameter arrays) into FKL's (views, sizes, vectors) and returns ONE FKL instantiable operation (IOp): the FKL
-// operations the function needs, joined with .then. FastRPP defines no operation of its own, and the only ReadBack
-// operation it uses is FKL's resize.
+// Each fastrpp::rppt_* function takes RPP's arguments but the handle and the back-end, checks them on the host,
+// translates RPP's objects (descriptors, ROIs, parameter arrays) into FKL's (views, sizes, vectors) and returns ONE FKL
+// instantiable operation (IOp): the FKL operations the function needs, joined with .then. FastRPP defines no operation
+// of its own, and the only ReadBack operation it uses is FKL's resize.
 //   rppt_resize_mirror_normalize  a read IOp: the crops of the source, resized and normalised
 //   rppt_channel_permute          a compute IOp: fk::VectorReorderRT (FastNPP's SwapChannels)
 //   rppt_copy                     a write IOp: the destination tensor (FastNPP's CopyBatch)
-// fastrpp::executeOperations(handle, iOps...) runs IOps as one kernel on the handle's stream, as fk::executeOperations
-// does: a read, any number of compute IOps, a write. Only a read IOp reads memory and only a write IOp writes it: the
-// other source and destination pointers keep RPP's signatures and are never accessed, so in
-// executeOperations(handle, rmn, cp, copy) no intermediate tensor is read or written.
+// fastrpp::executeOperations(rppHandle, executionBackend, iOps...) runs IOps as fk::executeOperations does: a read, any
+// number of compute IOps, a write, fused into one. It is the only FastRPP function that takes RPP's handle (RPP's own
+// rppHandle_t) and RPP's execution back-end:
+//   RPP_HIP_BACKEND   one GPU kernel on the handle's hipStream_t, in an fk::Stream (as FastNPP's executeOperations does
+//                     with an NppStreamContext)
+//   RPP_HOST_BACKEND  FKL's CPU executor, on host memory: ParArch::CPU_MULTITHREAD when FK_CPU_MULTITHREAD_ENABLED is
+//                     defined (FastRPP's CMake defines it), ParArch::CPU otherwise; it returns when the work is done
+// Only a read IOp reads memory and only a write IOp writes it: the other source and destination pointers keep RPP's
+// signatures and are never accessed, so in executeOperations(rppHandle, backend, rmn, cp, copy) no intermediate tensor is
+// read or written. An IOp holds the pointers it was built with: they must be in the memory of the back-end it runs on
+// (device memory for RPP_HIP_BACKEND, host memory for RPP_HOST_BACKEND), as RPP's back-ends require.
 //
-// A failed check throws fastrpp::Error, which carries RPP's status. RPP's types are used as they are (rppdefs.h):
-// FastRPP needs RPP's headers, never librpp. The handle is FastRPP's own. Semantics and every difference from RPP 3.2.0:
-// README.md.
+// A failed check throws fastrpp::Error, which carries RPP's status. RPP's types and handle are used as they are (rpp.h);
+// librpp gives rppGetStream, which executeOperations calls for the HIP back-end. Semantics and every difference from RPP
+// 3.2.0: README.md.
 
-#include <rpp/rpp_backend.h>
-#include <rpp/rppdefs.h>
+#include <rpp/rpp.h>
 
 #include <fused_kernel/fused_kernel.h>
 #include <fused_kernel/algorithms/basic_ops/arithmetic.h>
@@ -53,6 +59,10 @@
 #include <string>
 #include <utility>
 
+#if !RPP_BACKEND_HIP
+#error "FastRPP needs RPP's HIP back-end (RPP_BACKEND_HIP): executeOperations runs on the stream of an RPP HIP handle"
+#endif
+
 namespace fastrpp {
 
 // ===================================================== errors =====================================================
@@ -67,48 +77,6 @@ public:
 private:
     RppStatus status_;
 };
-
-// ===================================================== handle =====================================================
-
-// FastRPP's handle: the batch size and the stream. FKL needs no scratch memory, so it holds no device memory. It is a
-// different type from RPP's rppHandle_t: an RPP handle cannot be passed to FastRPP by mistake.
-struct rppHandle {
-    size_t batchSize;
-    fk::Stream_<fk::ParArch::GPU_AMD> stream; // wraps the hipStream_t given to rppCreate, which it never destroys
-};
-typedef rppHandle* rppHandle_t;
-
-// RPP's rppCreate. Only RppBackend::RPP_HIP_BACKEND is implemented; numThreads is ignored (RPP uses it only for the host
-// back-end); stream nullptr is the null stream. It returns a status, as RPP's does: it builds no operation.
-inline rppStatus_t rppCreate(rppHandle_t* handle, size_t nBatchSize, Rpp32u numThreads = 0, void* stream = nullptr,
-                             RppBackend backend = RppBackend::RPP_HOST_BACKEND) {
-    static_cast<void>(numThreads);
-    if (handle == nullptr || nBatchSize == 0) {
-        return rppStatusBadParm;
-    }
-    if (backend != RppBackend::RPP_HIP_BACKEND) {
-        return rppStatusNotImplemented;
-    }
-    try {
-        *handle = new rppHandle{nBatchSize, fk::Stream_<fk::ParArch::GPU_AMD>(static_cast<hipStream_t>(stream))};
-    } catch (const std::exception&) {
-        return rppStatusAllocFailed;
-    }
-    return rppStatusSuccess;
-}
-
-// RPP's rppDestroy. As in RPP 3.2.0's GPU build, either back-end value destroys the handle (RPP_HOST_BACKEND is the
-// default argument). The stream given to rppCreate is the caller's and stays alive, as in RPP.
-inline rppStatus_t rppDestroy(rppHandle_t handle, RppBackend backend = RppBackend::RPP_HOST_BACKEND) {
-    if (backend != RppBackend::RPP_HOST_BACKEND && backend != RppBackend::RPP_HIP_BACKEND) {
-        return rppStatusNotImplemented;
-    }
-    if (handle == nullptr) {
-        return rppStatusBadParm;
-    }
-    delete handle;
-    return rppStatusSuccess;
-}
 
 // ============================================= shared-source batch ================================================
 
@@ -141,6 +109,13 @@ namespace detail {
 
 inline const char* side(const bool source) { return source ? "the source" : "the destination"; }
 
+// FKL's CPU executor for RppBackend::RPP_HOST_BACKEND: the multithreaded one when FKL's thread pool is compiled in
+#if defined(FK_CPU_MULTITHREAD_ENABLED)
+constexpr fk::ParArch HOST_PAR_ARCH = fk::ParArch::CPU_MULTITHREAD;
+#else
+constexpr fk::ParArch HOST_PAR_ARCH = fk::ParArch::CPU;
+#endif
+
 // The FKL views of RPP's tensors: a crop of a U8 NHWC image, and a whole F32 NCHW tensor
 using SourceView = fk::RawPtr<fk::ND::_2D, fk::uchar3>;
 using TensorView = fk::RawPtr<fk::ND::_3D, float>;
@@ -164,7 +139,8 @@ inline TensorView tensorView(void* const ptr, const RpptDesc& d) {
     return v;
 }
 
-// The checks of every descriptor, in this order; n must be the batch size
+// The checks of every descriptor, in this order; n must be the batch size: BATCH for rppt_resize_mirror_normalize, the
+// source's n for rppt_channel_permute and rppt_copy
 inline void checkDesc(const RpptDesc& d, const bool source, const RpptDataType type, const RpptLayout layout, const Rpp32u channels,
                       const size_t batch, const char* const function) {
     if (d.numDims != 4) {
@@ -185,19 +161,19 @@ inline void checkDesc(const RpptDesc& d, const bool source, const RpptDataType t
     if (d.n != batch) {
         fail(RPP_ERROR_INVALID_ARGUMENTS, function, std::string(side(source)) + " n is not the batch size");
     }
-    if (d.w == 0u || d.h == 0u) {
-        fail(RPP_ERROR_INVALID_DIM_LENGTHS, function, std::string(side(source)) + " width or height is 0");
+    if (d.n == 0u || d.w == 0u || d.h == 0u) {
+        fail(RPP_ERROR_INVALID_DIM_LENGTHS, function, std::string(side(source)) + " n, width or height is 0");
     }
 }
 
-// The checks of the functions on F32 NCHW tensors (rppt_channel_permute, rppt_copy): the handle, both descriptors, the
-// same width and height
-inline void checkTensorPair(const RpptDesc* const src, const RpptDesc* const dst, const rppHandle_t rppHandle, const char* const function) {
-    if (rppHandle == nullptr || src == nullptr || dst == nullptr) {
-        fail(RPP_ERROR_INVALID_ARGUMENTS, function, "a null handle or descriptor");
+// The checks of the functions on F32 NCHW tensors (rppt_channel_permute, rppt_copy): both descriptors, the same n (the
+// source's is the batch size), the same width and height
+inline void checkTensorPair(const RpptDesc* const src, const RpptDesc* const dst, const char* const function) {
+    if (src == nullptr || dst == nullptr) {
+        fail(RPP_ERROR_INVALID_ARGUMENTS, function, "a null descriptor");
     }
-    checkDesc(*src, true, RpptDataType::F32, RpptLayout::NCHW, 3u, rppHandle->batchSize, function);
-    checkDesc(*dst, false, RpptDataType::F32, RpptLayout::NCHW, 3u, rppHandle->batchSize, function);
+    checkDesc(*src, true, RpptDataType::F32, RpptLayout::NCHW, 3u, src->n, function);
+    checkDesc(*dst, false, RpptDataType::F32, RpptLayout::NCHW, 3u, src->n, function);
     if (src->w != dst->w || src->h != dst->h) {
         fail(RPP_ERROR_INVALID_DIM_LENGTHS, function, "the source and the destination have different widths or heights");
     }
@@ -247,39 +223,34 @@ using ResizeNormalizeImage =
 // Implemented: BILINEAR; source U8 NHWC, 3 channels, packed pixels (nStride may be 0, see sharedSourceDesc);
 // destination F32 NCHW, 3 channels; every dstImgSizes[i] equal to the destination's w x h; no image mirrored
 // (mirrorTensor[i] == 1 throws RPP_ERROR_NOT_IMPLEMENTED: FKL has no mirror but through a ReadBack operation other than
-// the resize; any other value is no mirror, as in RPP). BATCH = srcDesc n = dstDesc n = the handle's batch size.
-// dstPtr is not accessed: the destination descriptor gives the output size, and the values go to the next IOp (a write,
-// such as rppt_copy, puts them in memory). The parameter arrays are read on the host, now, and their values are copied
-// into the IOp: they must be host-readable, and they may change as soon as this returns. The ROI array is not modified.
+// the resize; any other value is no mirror, as in RPP's HIP back-end, whereas its host back-end mirrors on any value but
+// 0). BATCH = srcDesc n = dstDesc n: the kernel runs one image per
+// plane of this read, so the write of the chain must hold BATCH images (rppt_copy: n = BATCH). dstPtr is not accessed:
+// the destination descriptor gives the output size, and the values go to the next IOp (a write, such as rppt_copy, puts
+// them in memory). The parameter arrays are read on the host, now, and their values are copied into the IOp: they must
+// be host-readable, and they may change as soon as this returns. The ROI array is not modified.
 template <size_t BATCH, RpptDataType SRC_TYPE = RpptDataType::U8, RpptLayout SRC_LAYOUT = RpptLayout::NHWC,
           RpptDataType DST_TYPE = RpptDataType::F32, RpptLayout DST_LAYOUT = RpptLayout::NCHW, Rpp32u CHANNELS = 3>
 inline auto rppt_resize_mirror_normalize(RppPtr_t srcPtr, RpptDescPtr srcDescPtr, RppPtr_t dstPtr, RpptDescPtr dstDescPtr,
                                          RpptImagePatchPtr dstImgSizes, RpptInterpolationType interpolationType, Rpp32f* meanTensor,
-                                         Rpp32f* stdDevTensor, Rpp32u* mirrorTensor, RpptROIPtr roiTensorPtrSrc, RpptRoiType roiType,
-                                         rppHandle_t rppHandle, RppBackend executionBackend) {
+                                         Rpp32f* stdDevTensor, Rpp32u* mirrorTensor, RpptROIPtr roiTensorPtrSrc, RpptRoiType roiType) {
     static_assert(BATCH > 0, "BATCH must be at least 1");
     static_assert(SRC_TYPE == RpptDataType::U8 && SRC_LAYOUT == RpptLayout::NHWC && DST_TYPE == RpptDataType::F32 &&
                       DST_LAYOUT == RpptLayout::NCHW && CHANNELS == 3,
                   "FastRPP implements rppt_resize_mirror_normalize from U8 NHWC to F32 NCHW, 3 channels");
     constexpr const char* function = "rppt_resize_mirror_normalize";
     static_cast<void>(dstPtr); // not accessed: the IOp's values go to the next IOp
-    if (executionBackend != RppBackend::RPP_HIP_BACKEND) {
-        detail::fail(RPP_ERROR_NOT_IMPLEMENTED, function, "only RPP_HIP_BACKEND is implemented");
-    }
     if (interpolationType != RpptInterpolationType::BILINEAR) {
         detail::fail(RPP_ERROR_NOT_IMPLEMENTED, function, "only BILINEAR interpolation is implemented");
     }
-    if (rppHandle == nullptr || srcPtr == nullptr || srcDescPtr == nullptr || dstDescPtr == nullptr || dstImgSizes == nullptr ||
-        meanTensor == nullptr || stdDevTensor == nullptr || mirrorTensor == nullptr || roiTensorPtrSrc == nullptr) {
-        detail::fail(RPP_ERROR_INVALID_ARGUMENTS, function, "a null handle, source, descriptor or parameter array");
+    if (srcPtr == nullptr || srcDescPtr == nullptr || dstDescPtr == nullptr || dstImgSizes == nullptr || meanTensor == nullptr ||
+        stdDevTensor == nullptr || mirrorTensor == nullptr || roiTensorPtrSrc == nullptr) {
+        detail::fail(RPP_ERROR_INVALID_ARGUMENTS, function, "a null source, descriptor or parameter array");
     }
     const RpptDesc& src = *srcDescPtr;
     const RpptDesc& dst = *dstDescPtr;
     detail::checkDesc(src, true, RpptDataType::U8, RpptLayout::NHWC, 3u, BATCH, function);
     detail::checkDesc(dst, false, RpptDataType::F32, RpptLayout::NCHW, 3u, BATCH, function);
-    if (rppHandle->batchSize != BATCH) {
-        detail::fail(RPP_ERROR_INVALID_ARGUMENTS, function, "the handle's batch size is not BATCH");
-    }
     if (src.strides.cStride != 1u || src.strides.wStride != 3u || src.strides.hStride < 3u * src.w) {
         detail::fail(RPP_ERROR_INVALID_SRC_LAYOUT, function, "the source pixels are not packed (cStride 1, wStride 3, hStride >= 3 * w)");
     }
@@ -321,29 +292,25 @@ inline auto rppt_resize_mirror_normalize(RppPtr_t srcPtr, RpptDescPtr srcDescPtr
 
 // RPP's rppt_channel_permute (rppt_tensor_data_exchange_operations.h) as one FKL compute IOp, fk::VectorReorderRT (as
 // FastNPP's SwapChannels): output channel k is input channel permutationTensor[k], as in RPP. Implemented: F32 NCHW to
-// F32 NCHW, 3 channels, the same width and height; n = the handle's batch size. FKL's compute operations have the same
+// F32 NCHW, 3 channels, the same n, width and height. FKL's compute operations have the same
 // parameters for every image, so every image must have the same triple (RPP_ERROR_NOT_IMPLEMENTED otherwise), and it
 // must be one of the six permutations of 0, 1, 2, the function RPP documents (RPP_ERROR_INVALID_ARGUMENTS otherwise;
 // RPP checks nothing). srcPtr and dstPtr are not accessed: the IOp takes its input from the IOp before it and gives its
 // output to the next one. The permutations are read on the host, now.
 template <RpptDataType TYPE = RpptDataType::F32, RpptLayout SRC_LAYOUT = RpptLayout::NCHW, RpptLayout DST_LAYOUT = RpptLayout::NCHW,
           Rpp32u CHANNELS = 3>
-inline auto rppt_channel_permute(RppPtr_t srcPtr, RpptDescPtr srcDescPtr, RppPtr_t dstPtr, RpptDescPtr dstDescPtr, Rpp32u* permutationTensor,
-                                 rppHandle_t rppHandle, RppBackend executionBackend) {
+inline auto rppt_channel_permute(RppPtr_t srcPtr, RpptDescPtr srcDescPtr, RppPtr_t dstPtr, RpptDescPtr dstDescPtr, Rpp32u* permutationTensor) {
     static_assert(TYPE == RpptDataType::F32 && SRC_LAYOUT == RpptLayout::NCHW && DST_LAYOUT == RpptLayout::NCHW && CHANNELS == 3,
                   "FastRPP implements rppt_channel_permute from F32 NCHW to F32 NCHW, 3 channels");
     constexpr const char* function = "rppt_channel_permute";
     static_cast<void>(srcPtr); // not accessed: the input comes from the IOp before it
     static_cast<void>(dstPtr); // not accessed: the output goes to the next IOp
-    if (executionBackend != RppBackend::RPP_HIP_BACKEND) {
-        detail::fail(RPP_ERROR_NOT_IMPLEMENTED, function, "only RPP_HIP_BACKEND is implemented");
-    }
     if (permutationTensor == nullptr) {
         detail::fail(RPP_ERROR_INVALID_ARGUMENTS, function, "a null permutation array");
     }
-    detail::checkTensorPair(srcDescPtr, dstDescPtr, rppHandle, function);
+    detail::checkTensorPair(srcDescPtr, dstDescPtr, function);
     const Rpp32u* const first = permutationTensor;
-    for (size_t i = 0; i < rppHandle->batchSize; ++i) {
+    for (size_t i = 0; i < srcDescPtr->n; ++i) {
         const Rpp32u* const p = permutationTensor + 3 * i;
         if (!detail::isPermutation(p)) {
             detail::fail(RPP_ERROR_INVALID_ARGUMENTS, function, "a triple is not a permutation of 0, 1, 2");
@@ -360,23 +327,20 @@ inline auto rppt_channel_permute(RppPtr_t srcPtr, RpptDescPtr srcDescPtr, RppPtr
 
 // RPP's rppt_copy (rppt_tensor_data_exchange_operations.h) as one FKL write IOp, fk::TensorSplit (as FastNPP's
 // CopyBatch): the values of the IOps before it are written to the destination. Implemented: F32 NCHW to F32 NCHW,
-// 3 channels, the same width and height; n = the handle's batch size; a dense destination (the strides RpptDesc's
-// constructor gives) of at most 4 GiB. srcPtr is not accessed: the values come from the IOps before it.
+// 3 channels, the same n, width and height; a dense destination (the strides RpptDesc's constructor gives) of at most
+// 4 GiB. srcPtr is not accessed: the values come from the IOps before it. FKL writes every image the read of the chain
+// gives, with no bounds check: n must be the read's batch (BATCH of rppt_resize_mirror_normalize).
 template <RpptDataType TYPE = RpptDataType::F32, RpptLayout SRC_LAYOUT = RpptLayout::NCHW, RpptLayout DST_LAYOUT = RpptLayout::NCHW,
           Rpp32u CHANNELS = 3>
-inline auto rppt_copy(RppPtr_t srcPtr, RpptDescPtr srcDescPtr, RppPtr_t dstPtr, RpptDescPtr dstDescPtr, rppHandle_t rppHandle,
-                      RppBackend executionBackend) {
+inline auto rppt_copy(RppPtr_t srcPtr, RpptDescPtr srcDescPtr, RppPtr_t dstPtr, RpptDescPtr dstDescPtr) {
     static_assert(TYPE == RpptDataType::F32 && SRC_LAYOUT == RpptLayout::NCHW && DST_LAYOUT == RpptLayout::NCHW && CHANNELS == 3,
                   "FastRPP implements rppt_copy from F32 NCHW to F32 NCHW, 3 channels");
     constexpr const char* function = "rppt_copy";
     static_cast<void>(srcPtr); // not accessed: the values come from the IOps before it
-    if (executionBackend != RppBackend::RPP_HIP_BACKEND) {
-        detail::fail(RPP_ERROR_NOT_IMPLEMENTED, function, "only RPP_HIP_BACKEND is implemented");
-    }
     if (dstPtr == nullptr) {
         detail::fail(RPP_ERROR_INVALID_ARGUMENTS, function, "a null destination");
     }
-    detail::checkTensorPair(srcDescPtr, dstDescPtr, rppHandle, function);
+    detail::checkTensorPair(srcDescPtr, dstDescPtr, function);
     const RpptDesc& dst = *dstDescPtr;
     if (!detail::isDenseNCHW(dst)) {
         detail::fail(RPP_ERROR_INVALID_DST_LAYOUT, function, "the destination is not dense (the strides RpptDesc's constructor gives)");
@@ -389,17 +353,41 @@ inline auto rppt_copy(RppPtr_t srcPtr, RpptDescPtr srcDescPtr, RppPtr_t dstPtr, 
 
 // ================================================== execution =====================================================
 
-// Runs FKL IOps as one kernel on the stream of the handle, as FastNPP's executeOperations: fk::executeOperations with
-// fk::TransformDPP (AMD GPU, thread fusion off). Any FKL IOps can take part, FastRPP's or not; FKL checks at compile time
-// that they form a read, compute IOps and a write. It does not synchronise. A null handle throws fastrpp::Error
-// (RPP_ERROR_INVALID_ARGUMENTS); a HIP error pending after the launch throws FKL's std::runtime_error (FKL checks
+// Runs FKL IOps fused into one, as FastNPP's executeOperations does, on RPP's execution back-end:
+//   RPP_HIP_BACKEND   fk::executeOperations with fk::TransformDPP (AMD GPU, thread fusion off): one kernel on the stream
+//                     of rppHandle, which RPP's rppGetStream gives (the stream given to rppCreate; nullptr is the null
+//                     stream), in an fk::Stream that never destroys it. It does not synchronise. The memory the IOps
+//                     access must be device memory, or memory the GPU can access.
+//   RPP_HOST_BACKEND  fk::executeOperations with FKL's CPU executor (HOST_PAR_ARCH: CPU_MULTITHREAD, on FKL's thread
+//                     pool, when FK_CPU_MULTITHREAD_ENABLED is defined; CPU otherwise), thread fusion off. It returns
+//                     when the work is done, as RPP's host back-end does. The memory the IOps access must be host
+//                     memory. The handle is not used: RPP's API gives no access to its number of threads.
+// rppHandle is RPP's own handle, made by RPP's rppCreate. Its batch size and memory are not used. RPP's API does not tell
+// a host handle from a HIP handle on the null stream: with RPP_HIP_BACKEND, a host handle runs on the null stream. Any
+// FKL IOps can take part, FastRPP's or not; FKL checks at compile time that they form a read, compute IOps and a write.
+// The work covers one image per plane of the read, and the write must hold them all. A null handle throws
+// fastrpp::Error (RPP_ERROR_INVALID_ARGUMENTS), and so does a failed rppGetStream (RPP_ERROR; the message gives its
+// rppStatus_t). On the GPU, a HIP error pending after the launch throws FKL's std::runtime_error (FKL checks
 // hipGetLastError, so the error may come from earlier work on the device).
 template <typename... IOps>
-inline void executeOperations(rppHandle_t rppHandle, const IOps&... iOps) {
+inline void executeOperations(rppHandle_t rppHandle, RppBackend executionBackend, const IOps&... iOps) {
+    constexpr const char* function = "executeOperations";
     if (rppHandle == nullptr) {
-        detail::fail(RPP_ERROR_INVALID_ARGUMENTS, "executeOperations", "a null handle");
+        detail::fail(RPP_ERROR_INVALID_ARGUMENTS, function, "a null handle");
     }
-    fk::executeOperations<fk::TransformDPP<fk::ParArch::GPU_AMD, fk::TF::DISABLED>>(rppHandle->stream, iOps...);
+    if (executionBackend == RppBackend::RPP_HIP_BACKEND) {
+        rppAcceleratorQueue_t hipStream = nullptr;
+        const rppStatus_t status = ::rppGetStream(rppHandle, &hipStream);
+        if (status != rppStatusSuccess) {
+            detail::fail(RPP_ERROR, function, "rppGetStream failed with rppStatus_t " + std::to_string(static_cast<int>(status)));
+        }
+        fk::Stream_<fk::ParArch::GPU_AMD> stream(hipStream);
+        fk::executeOperations<fk::TransformDPP<fk::ParArch::GPU_AMD, fk::TF::DISABLED>>(stream, iOps...);
+    } else {
+        fk::Stream_<detail::HOST_PAR_ARCH> stream;
+        fk::executeOperations<fk::TransformDPP<detail::HOST_PAR_ARCH, fk::TF::DISABLED>>(stream, iOps...);
+        stream.sync(); // CPU_MULTITHREAD runs the work on FKL's thread pool; the IOps' raw pointers must stay valid until then
+    }
 }
 
 } // namespace fastrpp
