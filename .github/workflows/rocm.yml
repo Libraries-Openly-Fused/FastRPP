@@ -1,0 +1,42 @@
+name: ROCm (gfx1200)
+
+# Runs on the self-hosted ROCm runner, which is also a benchmark machine: only on pull requests to main and by hand,
+# never on a push, and one run per branch at a time (a pull request's runs and manual runs of its branch share a group).
+on:
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: [self-hosted, linux, x64, rocm]
+    env:
+      ROCM_PATH: /opt/rocm/core-10.1
+      HIP_PATH: /opt/rocm/core-10.1
+      FKL_PIN: 64ad9195cd785d0c93a70b35e02d5a6c7c4a5048
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Check the FKL pin (LTS-C++17)
+        run: |
+          test "$(git -C fkl rev-parse HEAD)" = "$FKL_PIN"
+
+      # Strict C++17, the flags of every FastRPP target (CMakeLists.txt): -Werror=c++20-extensions -pedantic-errors
+      - name: Configure
+        run: |
+          cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER="$ROCM_PATH/bin/amdclang++" -DCMAKE_HIP_COMPILER="$ROCM_PATH/bin/amdclang++" \
+            -DCMAKE_HIP_ARCHITECTURES=gfx1200
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        working-directory: build
+        run: ctest --output-on-failure --output-junit test_results.xml
